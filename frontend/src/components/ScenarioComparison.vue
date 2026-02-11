@@ -1,0 +1,16 @@
+<template>
+  <div class="scenario-comparison stub">
+    <p>ScenarioComparison — side-by-side scenario results (Phase 5)</p>
+  </div>
+</template>
+
+<style scoped>
+.stub {
+  padding: 1.5rem;
+  background: #fff;
+  border: 1px dashed #ccc;
+  border-radius: 8px;
+  color: #999;
+  text-align: center;
+}
+</style>
