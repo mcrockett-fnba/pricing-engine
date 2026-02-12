@@ -5,13 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db.connection import db_pool
+from app.services.model_service import initialize_models
 from app.api.routes import health, packages, valuation, models
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: initialize DB pool
+    # Startup: initialize DB pool and load models
     db_pool.initialize()
+    initialize_models()
     yield
     # Shutdown: close DB pool
     db_pool.close()

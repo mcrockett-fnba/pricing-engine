@@ -17,8 +17,8 @@ export function getPackage(packageId) {
   return client.get(`/packages/${packageId}`)
 }
 
-export function runValuation(packageId, config) {
-  return client.post('/valuations/run', { package_id: packageId, config })
+export function runValuation(pkg, config) {
+  return client.post('/valuations/run', { package: pkg, config })
 }
 
 export function getModelStatus() {

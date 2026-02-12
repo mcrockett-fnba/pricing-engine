@@ -6,6 +6,7 @@
       </div>
       <div class="navbar-links">
         <router-link to="/packages">Packages</router-link>
+        <router-link to="/valuations">Run Valuation</router-link>
         <router-link to="/models">Model Status</router-link>
       </div>
     </nav>

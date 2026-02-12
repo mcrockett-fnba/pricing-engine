@@ -27,9 +27,7 @@ node_modules/
 frontend/node_modules/
 
 # Model artifacts
-models/*.pkl
-models/*.joblib
-models/*.json
+models/*
 !models/.gitkeep
 
 # OS

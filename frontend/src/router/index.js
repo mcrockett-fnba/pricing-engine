@@ -1,12 +1,14 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import PackageList from '../views/PackageList.vue'
 import PackageValuation from '../views/PackageValuation.vue'
+import RunValuation from '../views/RunValuation.vue'
 import ModelStatus from '../views/ModelStatus.vue'
 
 const routes = [
   { path: '/', redirect: '/packages' },
   { path: '/packages', name: 'PackageList', component: PackageList },
   { path: '/packages/:id', name: 'PackageValuation', component: PackageValuation, props: true },
+  { path: '/valuations', name: 'RunValuation', component: RunValuation },
   { path: '/models', name: 'ModelStatus', component: ModelStatus },
 ]
 
