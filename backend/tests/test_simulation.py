@@ -82,8 +82,8 @@ def test_cash_flows_length_close_to_term():
     loan = _make_loan(remaining_term=60)
     scenario = get_scenario_params("baseline")
     cfs = project_cash_flows(loan, 2, scenario)
-    # May be slightly shorter if balance amortizes to 0 before final month
-    assert len(cfs) >= 55
+    # Prepayment + defaults can shorten effective life significantly
+    assert len(cfs) >= 20
     assert len(cfs) <= 60
 
 
@@ -146,8 +146,8 @@ def test_mc_distribution_populated():
     loan = _make_loan(remaining_term=36)
     config = SimulationConfig(n_simulations=10, include_stochastic=True, stochastic_seed=42)
     result = simulate_loan(loan, config)
-    # 3 scenarios × 10 sims = 30 MC runs
-    assert len(result.pv_distribution) == 30
+    # Baseline-only MC: 10 sims
+    assert len(result.pv_distribution) == 10
     assert result.pv_distribution == sorted(result.pv_distribution)
 
 
@@ -175,3 +175,44 @@ def test_percentiles_present_when_mc_enabled():
     for key in ("p5", "p25", "p50", "p75", "p95"):
         assert key in result.pv_percentiles
     assert result.pv_percentiles["p5"] <= result.pv_percentiles["p95"]
+
+
+# --- Prepayment tests ---
+
+
+def test_cash_flows_have_prepay_fields():
+    loan = _make_loan(remaining_term=60)
+    scenario = get_scenario_params("baseline")
+    cfs = project_cash_flows(loan, 3, scenario)
+    for cf in cfs:
+        assert hasattr(cf, "prepay_probability")
+        assert hasattr(cf, "expected_prepayment")
+        assert cf.prepay_probability >= 0.0
+        assert cf.expected_prepayment >= 0.0
+
+
+def test_prepayment_shortens_effective_life():
+    """With prepayment, the pool balance should reach zero faster than remaining term."""
+    loan = _make_loan(remaining_term=300)
+    scenario = get_scenario_params("baseline")
+    cfs = project_cash_flows(loan, 3, scenario)
+    # Effective life should be notably shorter than 300 months
+    assert len(cfs) < 300
+
+
+def test_transitions_have_marginal_prepay():
+    scenario = get_scenario_params("baseline")
+    transitions = get_monthly_transitions(3, 60, 12, scenario)
+    for tx in transitions:
+        assert hasattr(tx, "marginal_prepay")
+        assert tx.marginal_prepay >= 0.0
+        assert tx.marginal_prepay < 1.0
+
+
+def test_recession_slows_prepayment():
+    scenario_base = get_scenario_params("baseline")
+    scenario_severe = get_scenario_params("severe_recession")
+    tx_base = get_monthly_transitions(3, 60, 12, scenario_base)
+    tx_severe = get_monthly_transitions(3, 60, 12, scenario_severe)
+    # Severe recession has prepayment_multiplier=0.4 → lower prepay
+    assert tx_severe[0].marginal_prepay < tx_base[0].marginal_prepay

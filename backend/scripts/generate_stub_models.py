@@ -43,6 +43,8 @@ def generate_manifest() -> None:
             "deq": {"status": "stub", "path": "deq/"},
             "default": {"status": "stub", "path": "default/"},
             "recovery": {"status": "stub", "path": "recovery/"},
+            "prepayment": {"status": "stub", "path": "prepayment/"},
+            "apex2": {"status": "real", "path": "apex2/"},
         },
     }
     _write_json(MODELS_DIR / "manifest.json", manifest)
@@ -153,9 +155,43 @@ def _generate_survival_curves_csv(buckets: list[dict]) -> None:
     print(f"  wrote {out.relative_to(PROJECT_ROOT)} (CSV fallback)")
 
 
+def generate_apex2_tables() -> None:
+    """Write APEX2 dimensional lookup tables as JSON files."""
+    apex2_dir = MODELS_DIR / "apex2"
+    _write_json(apex2_dir / "credit_rates.json", {
+        "<576": 1.3583, "576-600": 1.5713, "601-625": 1.8124,
+        "626-650": 2.1814, "651-675": 2.4668, "676-700": 2.7220,
+        "701-725": 2.7022, "726-750": 2.7284, ">=751": 2.7159,
+    })
+    _write_json(apex2_dir / "rate_delta_rates.json", {
+        "<=-3%": 1.4307, "-2 to -2.99%": 1.2733, "-1 to -1.99%": 1.7116,
+        "-0.99 to 0.99%": 1.8363, "1 to 1.99%": 2.0108,
+        "2 to 2.99%": 2.4278, ">=3%": 2.3215,
+    })
+    _write_json(apex2_dir / "ltv_rates.json", {
+        "< 75%": 2.2420, "75% - 79.99%": 2.5268,
+        "80% - 84.99%": 2.5173, "85% - 89.99%": 2.0415,
+        ">= 90%": 1.6916,
+    })
+    _write_json(apex2_dir / "loan_size_rates.json", {
+        "$0 - $49,999": 1.3169, "$50,000 - $99,999": 1.6846,
+        "$100,000 - $149,999": 2.2964, "$150,000 - $199,999": 2.6937,
+        "$200,000 - $249,999": 2.8286, "$250,000 - $499,999": 2.9982,
+        "$500,000 - $999,999": 3.3578, "$1,000,000+": 3.3335,
+    })
+    _write_json(apex2_dir / "metadata.json", {
+        "model_type": "apex2",
+        "version": "1.0.0",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "description": "APEX2 dimensional prepayment lookup tables (Not-ITIN). "
+                       "Four dimensions: credit score, rate delta, LTV, and loan size. "
+                       "Production multipliers from APEX2 system.",
+    })
+
+
 def generate_metadata() -> None:
-    """Create metadata.json files for each model sub-directory."""
-    for name in ("survival", "deq", "default", "recovery"):
+    """Create metadata.json files for each stub model sub-directory."""
+    for name in ("survival", "deq", "default", "recovery", "prepayment"):
         meta = {
             "model_type": name,
             "version": "0.1.0-stub",
@@ -171,6 +207,7 @@ def main() -> None:
     buckets = generate_bucket_definitions()
     generate_survival_curves(buckets)
     generate_metadata()
+    generate_apex2_tables()
     print("Done.")
 
 

@@ -68,9 +68,9 @@ def test_valuation_custom_config_small_n():
         "config": {"n_simulations": 10, "include_stochastic": True, "stochastic_seed": 42},
     })
     data = response.json()
-    # 3 scenarios × 10 sims = 30 MC runs
+    # Baseline-only MC: 10 sims
     loan_result = data["loan_results"][0]
-    assert len(loan_result["pv_distribution"]) == 30
+    assert len(loan_result["pv_distribution"]) == 10
 
 
 def test_valuation_no_body_returns_422():

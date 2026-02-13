@@ -16,6 +16,7 @@ class ScenarioParams:
     deq_multiplier: float
     default_multiplier: float
     recovery_multiplier: float
+    prepayment_multiplier: float = 1.0
 
 
 _SCENARIOS: dict[str, ScenarioParams] = {
@@ -32,6 +33,7 @@ _SCENARIOS: dict[str, ScenarioParams] = {
         deq_multiplier=1.5,
         default_multiplier=1.3,
         recovery_multiplier=0.85,
+        prepayment_multiplier=0.7,
     ),
     "severe_recession": ScenarioParams(
         name="severe_recession",
@@ -39,6 +41,7 @@ _SCENARIOS: dict[str, ScenarioParams] = {
         deq_multiplier=2.5,
         default_multiplier=2.0,
         recovery_multiplier=0.65,
+        prepayment_multiplier=0.4,
     ),
 }
 

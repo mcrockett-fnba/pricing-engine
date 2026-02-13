@@ -9,6 +9,7 @@
         <div class="model-name">{{ name }}</div>
         <div class="model-badge" :class="info.status">{{ info.status.toUpperCase() }}</div>
         <div class="model-version">v{{ info.version }}</div>
+        <div v-if="info.description" class="model-description">{{ info.description }}</div>
       </div>
     </div>
   </div>
@@ -82,6 +83,16 @@ h1 {
 .model-version {
   font-size: 0.85rem;
   color: #888;
+}
+
+.model-description {
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  color: #555;
+  text-align: left;
+  line-height: 1.4;
+  border-top: 1px solid #eee;
+  padding-top: 0.75rem;
 }
 
 .loading, .error {

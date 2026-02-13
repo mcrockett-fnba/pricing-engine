@@ -3,6 +3,7 @@ import PackageList from '../views/PackageList.vue'
 import PackageValuation from '../views/PackageValuation.vue'
 import RunValuation from '../views/RunValuation.vue'
 import ModelStatus from '../views/ModelStatus.vue'
+import PrepaymentAnalysis from '../views/PrepaymentAnalysis.vue'
 
 const routes = [
   { path: '/', redirect: '/packages' },
@@ -10,6 +11,7 @@ const routes = [
   { path: '/packages/:id', name: 'PackageValuation', component: PackageValuation, props: true },
   { path: '/valuations', name: 'RunValuation', component: RunValuation },
   { path: '/models', name: 'ModelStatus', component: ModelStatus },
+  { path: '/prepayment', name: 'PrepaymentAnalysis', component: PrepaymentAnalysis },
 ]
 
 const router = createRouter({

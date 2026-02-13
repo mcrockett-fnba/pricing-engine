@@ -47,6 +47,7 @@ def project_cash_flows(
     """
     transitions = get_monthly_transitions(
         bucket_id, loan.loan_age, loan.remaining_term, scenario,
+        loan_rate=loan.interest_rate,
     )
 
     monthly_discount = get_monthly_discount_rate(scenario.coc_scenario)
@@ -63,16 +64,21 @@ def project_cash_flows(
 
         # Apply stochastic shocks if provided
         marginal_default = tx.marginal_default
+        marginal_prepay = tx.marginal_prepay
         deq_rate = tx.deq_rate
         recovery_rate = tx.recovery_rate
         if stochastic_shocks and i < len(stochastic_shocks):
             shock = stochastic_shocks[i]
             marginal_default = min(marginal_default * shock.get("default", 1.0), 1.0)
+            marginal_prepay = min(marginal_prepay * shock.get("prepay", 1.0), 1.0)
             deq_rate = min(deq_rate * shock.get("deq", 1.0), 1.0)
             recovery_rate = min(recovery_rate * shock.get("recovery", 1.0), 1.0)
 
-        # Survival probability decays by marginal default each month
-        cumulative_survival *= (1.0 - marginal_default)
+        # Survival entering this month (before any events)
+        survival_entering = cumulative_survival
+
+        # Joint survival: both default and prepayment reduce the surviving pool
+        cumulative_survival *= (1.0 - marginal_default) * (1.0 - marginal_prepay)
 
         # Scheduled payment (may be less than PMT if balance is small)
         scheduled = min(pmt, balance * (1.0 + loan.interest_rate / 12.0))
@@ -81,17 +87,19 @@ def project_cash_flows(
         expected_payment = scheduled * cumulative_survival
 
         # Expected loss = default_prob * LGD * balance * survival_entering_month
-        survival_entering = cumulative_survival / (1.0 - marginal_default) if marginal_default < 1.0 else 0.0
         expected_loss = marginal_default * tx.loss_severity * balance * survival_entering
 
         # Expected recovery on defaulted amount
         expected_recovery = marginal_default * recovery_rate * balance * survival_entering
 
+        # Expected prepayment: borrower pays off remaining balance at par
+        expected_prepayment = marginal_prepay * balance * survival_entering
+
         # Servicing cost on surviving balance
         servicing_cost = balance * monthly_servicing * cumulative_survival
 
-        # Net cash flow
-        net_cf = expected_payment - expected_loss + expected_recovery - servicing_cost
+        # Net cash flow (prepayment is a positive inflow)
+        net_cf = expected_payment + expected_prepayment - expected_loss + expected_recovery - servicing_cost
 
         # Discount factor: 1 / (1+r)^t
         discount_factor = 1.0 / (1.0 + monthly_discount) ** tx.month
@@ -106,16 +114,19 @@ def project_cash_flows(
             default_probability=round(marginal_default, 6),
             expected_loss=round(expected_loss, 2),
             expected_recovery=round(expected_recovery, 2),
+            prepay_probability=round(marginal_prepay, 6),
+            expected_prepayment=round(expected_prepayment, 2),
             servicing_cost=round(servicing_cost, 2),
             net_cash_flow=round(net_cf, 2),
             discount_factor=round(discount_factor, 6),
             present_value=round(present_value, 2),
         ))
 
-        # Amortize: reduce balance by principal portion and defaults
+        # Amortize: reduce balance by principal, defaults, and prepayments
         interest_payment = balance * loan.interest_rate / 12.0
         principal_payment = scheduled - interest_payment
-        default_loss = marginal_default * balance * survival_entering
-        balance = max(balance - principal_payment - default_loss, 0.0)
+        default_reduction = marginal_default * balance * survival_entering
+        prepay_reduction = marginal_prepay * balance * survival_entering
+        balance = max(balance - principal_payment - default_reduction - prepay_reduction, 0.0)
 
     return cash_flows

@@ -8,6 +8,7 @@
         <router-link to="/packages">Packages</router-link>
         <router-link to="/valuations">Run Valuation</router-link>
         <router-link to="/models">Model Status</router-link>
+        <router-link to="/prepayment">Prepayment</router-link>
       </div>
     </nav>
     <main class="container">

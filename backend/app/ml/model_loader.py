@@ -38,7 +38,9 @@ class ModelRegistry:
         self.manifest: ModelManifest | None = None
         self.bucket_definitions: list[dict[str, Any]] = []
         self.survival_curves: dict[int, list[float]] = {}  # bucket_id -> [prob_m1..m360]
+        self.prepayment_curves: dict[int, list[float]] = {}  # bucket_id -> [smm_m1..m360]
         self.xgb_model: Any = None
+        self.apex2_tables: dict[str, dict[str, float]] = {}
         self._loaded = False
         self._model_dir: Path | None = None
 
@@ -66,6 +68,8 @@ class ModelRegistry:
         self._load_bucket_definitions()
         self._load_xgb_model()
         self._load_survival_curves()
+        self._load_prepayment_curves()
+        self._load_apex2_tables()
         self._loaded = True
         logger.info("Model loading complete")
 
@@ -132,6 +136,50 @@ class ModelRegistry:
         except Exception as e:
             logger.warning("Failed to load survival curves: %s", e)
 
+    def _load_prepayment_curves(self) -> None:
+        parquet_path = self._model_dir / "prepayment" / "prepayment_curves.parquet"
+        if not parquet_path.is_file():
+            logger.info("No prepayment_curves.parquet — will use stub formulas")
+            return
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(str(parquet_path))
+            bucket_ids = table.column("bucket_id").to_pylist()
+            months = table.column("month").to_pylist()
+            smms = table.column("smm").to_pylist()
+
+            curves: dict[int, list[tuple[int, float]]] = {}
+            for bid, m, s in zip(bucket_ids, months, smms):
+                curves.setdefault(bid, []).append((m, s))
+
+            for bid, pairs in curves.items():
+                pairs.sort(key=lambda x: x[0])
+                self.prepayment_curves[bid] = [s for _, s in pairs]
+
+            logger.info(
+                "Loaded prepayment curves: %d buckets, %d total rows",
+                len(self.prepayment_curves),
+                len(bucket_ids),
+            )
+        except ImportError:
+            logger.info("pyarrow not installed — will use stub formulas")
+        except Exception as e:
+            logger.warning("Failed to load prepayment curves: %s", e)
+
+    def _load_apex2_tables(self) -> None:
+        apex2_dir = self._model_dir / "apex2"
+        if not apex2_dir.is_dir():
+            logger.info("No apex2/ directory — will use fallback tables")
+            return
+        table_names = ["credit_rates", "rate_delta_rates", "ltv_rates", "loan_size_rates"]
+        for name in table_names:
+            path = apex2_dir / f"{name}.json"
+            if path.is_file():
+                self.apex2_tables[name] = json.loads(path.read_text())
+                logger.info("Loaded APEX2 %s (%d entries)", name, len(self.apex2_tables[name]))
+            else:
+                logger.warning("Missing APEX2 table: %s", path)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -146,10 +194,13 @@ class ModelRegistry:
         if self.manifest:
             models_status = {}
             for name, info in self.manifest.models.items():
-                models_status[name] = {
+                entry = {
                     "status": info.get("status", "unknown"),
                     "version": self.manifest.version,
                 }
+                if info.get("description"):
+                    entry["description"] = info["description"]
+                models_status[name] = entry
             return {
                 "status": "loaded",
                 "version": self.manifest.version,
@@ -162,6 +213,6 @@ class ModelRegistry:
             "version": "0.0.0",
             "models": {
                 name: {"status": "stub", "version": "0.0.0"}
-                for name in ("survival", "deq", "default", "recovery")
+                for name in ("survival", "deq", "default", "recovery", "prepayment")
             },
         }

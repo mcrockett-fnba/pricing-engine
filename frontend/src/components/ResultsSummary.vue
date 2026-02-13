@@ -31,10 +31,6 @@
         </span>
       </div>
       <div class="metric">
-        <span class="label">Purchase Price</span>
-        <span class="value">{{ formatCurrency(result.purchase_price) }}</span>
-      </div>
-      <div class="metric">
         <span class="label">Total UPB</span>
         <span class="value">{{ formatCurrency(result.total_upb) }}</span>
       </div>

@@ -16,6 +16,8 @@ class MonthlyCashFlow(BaseModel):
     default_probability: float
     expected_loss: float
     expected_recovery: float
+    prepay_probability: float = 0.0
+    expected_prepayment: float = 0.0
     servicing_cost: float
     net_cash_flow: float
     discount_factor: float

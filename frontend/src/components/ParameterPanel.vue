@@ -9,10 +9,6 @@
           Name
           <input type="text" v-model="pkg.name" />
         </label>
-        <label>
-          Purchase Price ($)
-          <input type="number" v-model.number="pkg.purchase_price" min="0" step="1000" />
-        </label>
       </div>
     </div>
 
@@ -20,6 +16,19 @@
       <h3>
         Loans ({{ pkg.loans.length }})
         <button class="btn btn-sm" @click="$emit('addLoan')">+ Add Loan</button>
+        <button class="btn btn-sm btn-upload" @click="$refs.fileInput.click()">Upload Tape</button>
+        <button
+          v-if="pkg.package_id && pkg.package_id.startsWith('PKG-UPLOAD')"
+          class="btn btn-sm btn-reset"
+          @click="$emit('resetPackage')"
+        >Reset to Sample</button>
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".xlsx,.xls"
+          style="display: none"
+          @change="onFileSelected"
+        />
       </h3>
       <div class="loan-table-wrap">
         <table class="loan-input-table">
@@ -88,13 +97,24 @@
 </template>
 
 <script setup>
+import { ref } from 'vue'
+
 defineProps({
   pkg: { type: Object, required: true },
   config: { type: Object, required: true },
   loading: { type: Boolean, default: false },
 })
 
-defineEmits(['run', 'addLoan', 'removeLoan'])
+const emit = defineEmits(['run', 'addLoan', 'removeLoan', 'uploadTape', 'resetPackage'])
+const fileInput = ref(null)
+
+function onFileSelected(event) {
+  const file = event.target.files[0]
+  if (file) {
+    emit('uploadTape', file)
+    event.target.value = ''
+  }
+}
 </script>
 
 <style scoped>
@@ -225,6 +245,24 @@ h3 {
 .btn-primary:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.btn-upload {
+  background: #d1ecf1;
+  color: #0c5460;
+}
+
+.btn-upload:hover {
+  background: #bee5eb;
+}
+
+.btn-reset {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.btn-reset:hover {
+  background: #ffeaa7;
 }
 
 .btn-danger {

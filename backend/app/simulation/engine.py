@@ -29,6 +29,7 @@ def _generate_shocks(
             "deq": math.exp(rng.gauss(0, _MC_SIGMA)),
             "default": math.exp(rng.gauss(0, _MC_SIGMA)),
             "recovery": math.exp(rng.gauss(0, _MC_SIGMA)),
+            "prepay": math.exp(rng.gauss(0, _MC_SIGMA)),
         })
     return shocks
 
@@ -64,19 +65,20 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
         if scenario_name == "baseline":
             baseline_cash_flows = det_cfs
 
-        # Monte Carlo runs
-        if config.include_stochastic and config.n_simulations > 0:
-            base_seed = config.stochastic_seed or 42
-            # Unique seed per loan + scenario
-            loan_hash = hash(loan.loan_id) & 0xFFFFFFFF
-            scenario_hash = hash(scenario_name) & 0xFFFFFFFF
-            seed = (base_seed + loan_hash + scenario_hash) & 0xFFFFFFFF
+            # Monte Carlo runs — baseline scenario only for clean distribution
+            if config.include_stochastic and config.n_simulations > 0:
+                if config.stochastic_seed is not None:
+                    base_seed = config.stochastic_seed
+                    loan_hash = hash(loan.loan_id) & 0xFFFFFFFF
+                    seed = (base_seed + loan_hash) & 0xFFFFFFFF
+                    rng = random.Random(seed)
+                else:
+                    rng = random.Random()
 
-            rng = random.Random(seed)
-            for _ in range(config.n_simulations):
-                shocks = _generate_shocks(loan.remaining_term, rng)
-                mc_cfs = project_cash_flows(loan, bucket_id, scenario, shocks)
-                all_mc_pvs.append(round(_sum_pv(mc_cfs), 2))
+                for _ in range(config.n_simulations):
+                    shocks = _generate_shocks(loan.remaining_term, rng)
+                    mc_cfs = project_cash_flows(loan, bucket_id, scenario, shocks)
+                    all_mc_pvs.append(round(_sum_pv(mc_cfs), 2))
 
     # Sort MC distribution for percentile extraction
     all_mc_pvs.sort()

@@ -22,7 +22,7 @@ def test_model_status_returns_200():
     assert data["status"] in ("loaded", "not_loaded")
     if data["status"] == "loaded":
         assert "models" in data
-        for name in ("survival", "deq", "default", "recovery"):
+        for name in ("survival", "deq", "default", "recovery", "prepayment"):
             assert name in data["models"]
 
 

@@ -18,9 +18,22 @@ export function getPackage(packageId) {
 }
 
 export function runValuation(pkg, config) {
-  return client.post('/valuations/run', { package: pkg, config })
+  return client.post('/valuations/run', { package: pkg, config }, { timeout: 300000 })
 }
 
 export function getModelStatus() {
   return client.get('/models/status')
+}
+
+export function runPrepaymentAnalysis(pkg, config) {
+  return client.post('/prepayment/analyze', { package: pkg, config }, { timeout: 300000 })
+}
+
+export function uploadLoanTape(file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return client.post('/packages/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60000,
+  })
 }

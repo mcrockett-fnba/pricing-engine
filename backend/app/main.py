@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db.connection import db_pool
 from app.services.model_service import initialize_models
-from app.api.routes import health, packages, valuation, models
+from app.api.routes import health, packages, valuation, models, prepayment
 
 
 @asynccontextmanager
@@ -33,3 +33,4 @@ app.include_router(health.router, prefix="/api")
 app.include_router(packages.router, prefix="/api")
 app.include_router(valuation.router, prefix="/api")
 app.include_router(models.router, prefix="/api")
+app.include_router(prepayment.router, prefix="/api")

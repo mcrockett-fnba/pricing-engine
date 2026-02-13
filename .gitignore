@@ -39,5 +39,18 @@ Thumbs.db
 htmlcov/
 .coverage
 
+# Data files
+*.xlsx
+*.xls
+*.csv
+*.parquet
+inprogress/
+
+# Generated reports
+reports/
+
+# Temp files
+~$*
+
 # Generated
 *.log

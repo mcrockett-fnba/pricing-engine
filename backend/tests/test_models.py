@@ -96,13 +96,17 @@ def test_monthly_cash_flow():
         default_probability=0.001,
         expected_loss=25.0,
         expected_recovery=0.0,
+        prepay_probability=0.005,
+        expected_prepayment=1000.0,
         servicing_cost=25.0,
-        net_cash_flow=1138.0,
+        net_cash_flow=2138.0,
         discount_factor=0.9934,
-        present_value=1130.49,
+        present_value=2123.89,
     )
     assert cf.month == 1
-    assert cf.present_value == 1130.49
+    assert cf.present_value == 2123.89
+    assert cf.prepay_probability == 0.005
+    assert cf.expected_prepayment == 1000.0
 
 
 def test_loan_valuation_result():
