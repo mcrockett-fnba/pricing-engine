@@ -4,6 +4,7 @@ import PackageValuation from '../views/PackageValuation.vue'
 import RunValuation from '../views/RunValuation.vue'
 import ModelStatus from '../views/ModelStatus.vue'
 import PrepaymentAnalysis from '../views/PrepaymentAnalysis.vue'
+import SegmentationView from '../views/SegmentationView.vue'
 
 const routes = [
   { path: '/', redirect: '/packages' },
@@ -12,6 +13,7 @@ const routes = [
   { path: '/valuations', name: 'RunValuation', component: RunValuation },
   { path: '/models', name: 'ModelStatus', component: ModelStatus },
   { path: '/prepayment', name: 'PrepaymentAnalysis', component: PrepaymentAnalysis },
+  { path: '/segmentation', name: 'Segmentation', component: SegmentationView },
 ]
 
 const router = createRouter({

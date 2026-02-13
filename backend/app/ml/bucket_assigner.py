@@ -43,11 +43,22 @@ _HARDCODED_BUCKETS = [
 
 
 def assign_bucket(loan: dict[str, Any]) -> int:
-    """Return bucket_id (1-5) for a loan dict.
+    """Return bucket_id for a loan dict.
 
+    If segmentation tree is loaded, returns leaf_id (1-75+).
+    Otherwise falls back to 5-bucket system (1-5).
     Loan dict should have at minimum: credit_score, ltv.
     """
     registry = ModelRegistry.get()
+
+    # Strategy 0: Segmentation tree (top priority)
+    if registry.segmentation_tree is not None:
+        try:
+            bucket_id = _assign_via_segmentation_tree(registry, loan)
+            if bucket_id is not None:
+                return bucket_id
+        except Exception as e:
+            logger.warning("Segmentation tree assignment failed, falling back: %s", e)
 
     # Strategy 1: XGBoost model
     if registry.xgb_model is not None:
@@ -64,6 +75,60 @@ def assign_bucket(loan: dict[str, Any]) -> int:
 
     # Strategy 3: Hardcoded rules
     return _assign_via_rules(_HARDCODED_BUCKETS, loan)
+
+
+def _assign_via_segmentation_tree(registry: "ModelRegistry", loan: dict[str, Any]) -> int | None:
+    """Use segmentation tree to predict leaf_id.
+
+    Maps Loan model fields to training feature scale:
+      - interest_rate: decimal (0.072) → percent (7.2) via ×100
+      - ltv: decimal (0.80) → percent (80) via ×100
+      - credit_score → creditScore
+      - unpaid_balance → loanSize
+      - origination_date.year → noteDateYear (default 2021)
+      - state → stateGroup via mapping (default middle bin)
+      - dti default 36, ITIN default 0, origCustAmortMonth = original_term (default 360)
+    """
+    import numpy as np
+
+    state_mapping = registry.state_group_mapping
+    median_bin = max(state_mapping.values()) // 2 if state_mapping else 3
+
+    # Map loan fields to training features (order must match FEATURE_COLS)
+    state_str = str(loan.get("state", "")) if loan.get("state") else ""
+    state_group = state_mapping.get(state_str, median_bin)
+
+    origination_date = loan.get("origination_date")
+    if origination_date is not None:
+        try:
+            note_year = origination_date.year
+        except AttributeError:
+            note_year = 2021
+    else:
+        note_year = 2021
+
+    features = np.array([[
+        note_year,                                                # noteDateYear
+        loan.get("credit_score") or 700,                          # creditScore
+        loan.get("dti") or 36.0,                                  # dti
+        (loan.get("ltv") or 0.80) * 100,                          # ltv (decimal → percent)
+        (loan.get("interest_rate") or 0.07) * 100,                # interestRate (decimal → percent)
+        loan.get("unpaid_balance", 200000),                       # loanSize
+        state_group,                                              # stateGroup
+        loan.get("ITIN", 0),                                     # ITIN
+        loan.get("original_term") or 360,                         # origCustAmortMonth
+    ]])
+
+    node_id = registry.segmentation_tree.apply(features)[0]
+    node_to_leaf = registry.tree_structure.get("node_to_leaf", {})
+
+    # node_to_leaf keys are strings in JSON
+    leaf_id = node_to_leaf.get(str(node_id))
+    if leaf_id is None:
+        logger.warning("Node %d not found in node_to_leaf mapping", node_id)
+        return None
+
+    return int(leaf_id)
 
 
 def _assign_via_xgb(model: Any, loan: dict[str, Any]) -> int | None:

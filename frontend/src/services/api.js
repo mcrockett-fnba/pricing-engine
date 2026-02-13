@@ -29,6 +29,22 @@ export function runPrepaymentAnalysis(pkg, config) {
   return client.post('/prepayment/analyze', { package: pkg, config }, { timeout: 300000 })
 }
 
+export function getSegmentationTree() {
+  return client.get('/segmentation/tree')
+}
+
+export function getSegmentationLeaves() {
+  return client.get('/segmentation/leaves')
+}
+
+export function getLeafDetail(leafId) {
+  return client.get(`/segmentation/leaf/${leafId}`)
+}
+
+export function getLeafLoans(leafId, params = {}) {
+  return client.get(`/segmentation/leaf/${leafId}/loans`, { params })
+}
+
 export function uploadLoanTape(file) {
   const formData = new FormData()
   formData.append('file', file)

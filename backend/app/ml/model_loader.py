@@ -41,6 +41,9 @@ class ModelRegistry:
         self.prepayment_curves: dict[int, list[float]] = {}  # bucket_id -> [smm_m1..m360]
         self.xgb_model: Any = None
         self.apex2_tables: dict[str, dict[str, float]] = {}
+        self.segmentation_tree: Any = None
+        self.tree_structure: dict[str, Any] = {}
+        self.state_group_mapping: dict[str, int] = {}
         self._loaded = False
         self._model_dir: Path | None = None
 
@@ -70,6 +73,7 @@ class ModelRegistry:
         self._load_survival_curves()
         self._load_prepayment_curves()
         self._load_apex2_tables()
+        self._load_segmentation_tree()
         self._loaded = True
         logger.info("Model loading complete")
 
@@ -179,6 +183,40 @@ class ModelRegistry:
                 logger.info("Loaded APEX2 %s (%d entries)", name, len(self.apex2_tables[name]))
             else:
                 logger.warning("Missing APEX2 table: %s", path)
+
+    def _load_segmentation_tree(self) -> None:
+        seg_dir = self._model_dir / "segmentation"
+        if not seg_dir.is_dir():
+            logger.info("No segmentation/ directory — will use fallback buckets")
+            return
+
+        # Load tree pickle
+        tree_path = seg_dir / "segmentation_tree.pkl"
+        if tree_path.is_file():
+            try:
+                import joblib
+                self.segmentation_tree = joblib.load(tree_path)
+                logger.info("Loaded segmentation tree from %s", tree_path)
+            except ImportError:
+                logger.info("joblib not installed — skipping segmentation tree")
+                return
+            except Exception as e:
+                logger.warning("Failed to load segmentation tree: %s", e)
+                return
+
+        # Load tree structure JSON
+        structure_path = seg_dir / "tree_structure.json"
+        if structure_path.is_file():
+            self.tree_structure = json.loads(structure_path.read_text())
+            logger.info(
+                "Loaded tree structure: %d leaves",
+                len(self.tree_structure.get("leaves", [])),
+            )
+
+            # Extract state group mapping
+            self.state_group_mapping = self.tree_structure.get("state_group_mapping", {})
+            if self.state_group_mapping:
+                logger.info("Loaded %d state group mappings", len(self.state_group_mapping))
 
     # ------------------------------------------------------------------
     # Public API

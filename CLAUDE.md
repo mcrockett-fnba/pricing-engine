@@ -53,7 +53,8 @@ pricingEngine/
 │   │   │       ├── packages.py  # GET /api/packages, POST /api/packages/upload, GET /api/packages/{id}
 │   │   │       ├── valuation.py # POST /api/valuations/run
 │   │   │       ├── models.py    # GET /api/models/status
-│   │   │       └── prepayment.py# POST /api/prepayment/analyze
+│   │   │       ├── prepayment.py# POST /api/prepayment/analyze
+│   │   │       └── segmentation.py # GET /api/segmentation/* (tree, leaves, leaf detail, loans)
 │   │   ├── db/
 │   │   │   ├── connection.py    # DatabasePool (pyodbc connection pooling)
 │   │   │   └── queries/
@@ -85,6 +86,7 @@ pricingEngine/
 │   │   ├── test_upload_route.py # 3 tests for upload endpoint
 │   │   └── ... (13 test files total, ~113 tests)
 │   ├── scripts/
+│   │   ├── train_segmentation_tree.py # Train 75-leaf tree on blended FNBA+Freddie
 │   │   ├── generate_stub_models.py    # Produces all model artifacts in models/
 │   │   ├── generate_apex2_summary.py  # Generates Word doc summary of APEX2 review
 │   │   ├── apex2_comparison.py        # Compares engine APEX2 vs production APEX2 spreadsheet
@@ -95,13 +97,14 @@ pricingEngine/
 ├── frontend/
 │   ├── src/
 │   │   ├── App.vue              # Shell with nav bar (Packages, Valuation, Prepayment, Models)
-│   │   ├── router/index.js      # Routes: /, /packages, /packages/:id, /valuations, /models, /prepayment
+│   │   │   ├── router/index.js      # Routes: /, /packages, /packages/:id, /valuations, /models, /prepayment, /segmentation
 │   │   ├── views/
 │   │   │   ├── PackageList.vue      # Lists DB packages
 │   │   │   ├── PackageValuation.vue # DB package detail + valuation
 │   │   │   ├── RunValuation.vue     # Main valuation page (sample/uploaded package)
 │   │   │   ├── ModelStatus.vue      # Shows all models with status badges (stub/real)
-│   │   │   └── PrepaymentAnalysis.vue # APEX2 analysis UI
+│   │   │   ├── PrepaymentAnalysis.vue # APEX2 analysis UI
+│   │   │   └── SegmentationView.vue # Tree diagram + leaf table + detail panel + loan drill-through
 │   │   ├── components/
 │   │   │   ├── ParameterPanel.vue   # Loan editor + upload tape button + reset button
 │   │   │   ├── ValuationResults.vue # Results display
@@ -121,7 +124,12 @@ pricingEngine/
 │   │   ├── ltv_rates.json
 │   │   ├── loan_size_rates.json
 │   │   └── metadata.json
-│   ├── survival/                # Survival curves + bucket defs (status: stub)
+│   ├── segmentation/            # Decision tree + structure + per-leaf loan parquets (status: real)
+│   │   ├── segmentation_tree.pkl
+│   │   ├── tree_structure.json
+│   │   ├── segmentation_metadata.json
+│   │   └── leaves/              # 75 parquet files (leaf_1_loans.parquet, ...)
+│   ├── survival/                # KM survival curves keyed by leaf_id (status: real)
 │   ├── prepayment/              # Prepayment curves + trained models (status: stub)
 │   │   ├── freddie_payoff_model.pkl      # XGBoost trained on Freddie Mac payoff data
 │   │   ├── freddie_payoff_metadata.json
@@ -170,6 +178,10 @@ pytest tests/ -v
 | `POST` | `/api/valuations/run` | Run Monte Carlo valuation on inline package |
 | `GET` | `/api/models/status` | Model registry status (all models + badges) |
 | `POST` | `/api/prepayment/analyze` | APEX2 prepayment analysis on inline package |
+| `GET` | `/api/segmentation/tree` | Full tree structure JSON for visualization |
+| `GET` | `/api/segmentation/leaves` | Flat leaf summary list |
+| `GET` | `/api/segmentation/leaf/{id}` | Leaf detail + survival curve |
+| `GET` | `/api/segmentation/leaf/{id}/loans` | Paginated training loans (filter by source) |
 
 ### Key Request/Response Shapes
 
@@ -189,8 +201,10 @@ The `ModelRegistry` singleton loads artifacts from `models/` at startup. Each mo
 - **real**: Trained on actual data (green badge in UI)
 
 Current model statuses:
+- `segmentation`: **real** — 75-leaf decision tree on 4.4M blended loans (FNBA + Freddie)
+- `survival`: **real** — per-leaf Kaplan-Meier survival curves (360 months, censoring-aware)
 - `apex2`: **real** — production APEX2 dimensional lookup tables
-- `survival`, `deq`, `default`, `recovery`, `prepayment`: **stub** — formula-based placeholders
+- `deq`, `default`, `recovery`, `prepayment`: **stub** — formula-based placeholders
 
 ### APEX2 Prepayment Model
 
@@ -202,9 +216,28 @@ The production prepayment model. Four dimensional lookup tables produce a prepay
 
 Multiplier = average of 4 dimensions. Applied as extra principal payment in monthly projection. A 30-month seasoning ramp phases in the prepayment gradually for newly originated loans.
 
-### Bucket Assigner (3-tier fallback)
+### Segmentation Tree (NEW — implemented)
 
-Used by the Monte Carlo engine to assign loans to risk buckets (1-5):
+Interpretable decision tree trained on blended data: 41,897 FNBA internal + 4.38M Freddie Mac (10% sample of 43.8M). Uses ALL loans including censored observations.
+
+- **75 leaves**, max depth 11
+- Features: `noteDateYear, creditScore, dti, ltv, interestRate, loanSize, stateGroup, ITIN, origCustAmortMonth`
+- Per-leaf Kaplan-Meier survival curves (months 1-360, EMA smoothed, tail extrapolated)
+- Training loan membership stored per leaf in parquet for management drill-through
+- States pre-binned into 6 groups by median payoff time
+
+**To retrain**: `cd backend && python scripts/train_segmentation_tree.py` (~100s)
+
+**API endpoints**:
+- `GET /api/segmentation/tree` — full tree structure for visualization
+- `GET /api/segmentation/leaves` — flat leaf summary list
+- `GET /api/segmentation/leaf/{id}` — leaf detail + survival curve
+- `GET /api/segmentation/leaf/{id}/loans?source=fnba&page=1` — paginated training loans
+
+### Bucket Assigner (4-tier fallback)
+
+Used by the Monte Carlo engine to assign loans to buckets:
+0. **Segmentation tree** `.apply()` if `models/segmentation/segmentation_tree.pkl` exists → returns leaf_id (1-75)
 1. XGBoost `.predict()` if `models/survival/model.pkl` exists
 2. JSON rule definitions from `models/survival/bucket_definitions.json`
 3. Hardcoded 5-bucket rules (credit score + LTV thresholds)
@@ -244,18 +277,18 @@ Two XGBoost models have been trained and stored in `models/prepayment/`:
 
 **Rate environment dominance**: `noteDateYear` captures 33-48% of feature importance. A 3% loan in a 4.5% market has zero refi incentive regardless of credit quality.
 
-## Next Phase: Segmentation Tree
+## Remaining Work: Segmentation Tree
 
-The full plan is at `~/.claude/plans/merry-marinating-zephyr.md`. Summary:
+The full plan is at `~/.claude/plans/merry-marinating-zephyr.md`.
 
-**Goal**: Train a single interpretable decision tree on blended FNBA + Freddie data (ALL loans, not just payoffs), extract 50-100 leaf buckets with Kaplan-Meier survival curves, and wire into the Monte Carlo pipeline.
+**Completed**:
+1. Training script (`backend/scripts/train_segmentation_tree.py`) — 75 leaves, 4.4M loans, KM curves, loan traceability
+2. Backend integration — ModelRegistry loading, 4-tier bucket assigner, 4 API endpoints with loan drill-through
+3. Frontend — Segmentation nav link, SVG tree diagram, leaf summary table, leaf detail panel with survival curve canvas, paginated loan viewer with source filtering and CSV export
 
-Key steps:
-1. **Training script** (`backend/scripts/train_segmentation_tree.py`) — blend 42K FNBA + 3.1M Freddie, train `DecisionTreeRegressor(max_leaf_nodes=75)`, compute KM survival per leaf, store training loan membership per leaf for traceability
-2. **Backend integration** — add segmentation tree to `ModelRegistry`, new assignment strategy in `bucket_assigner.py`, new API endpoints for tree visualization + leaf drill-through
-3. **Granular scenario framework** — rate-shift and segment-specific stress overlays per leaf, replacing flat 3-scenario system
-4. **Frontend** — SVG tree diagram, leaf detail panel with survival curve, paginated training loan viewer for management drill-through
-5. **Verification** — compare effective life estimates against APEX2 amort plug
+**Remaining**:
+- **Granular scenario framework** — rate-shift and segment-specific stress overlays per leaf, replacing flat 3-scenario system
+- **Verification** — compare effective life estimates against APEX2 amort plug on loan_tape_2_clean
 
 ### Feature Scale Conversions (for segmentation tree inference)
 
@@ -279,10 +312,11 @@ Key steps:
 
 | Script | Purpose | Run From |
 |--------|---------|----------|
-| `generate_stub_models.py` | Regenerate all model artifacts in `models/` | `backend/` |
+| `train_segmentation_tree.py` | **Primary**: Train 75-leaf tree on blended data (~100s) | `backend/` |
+| `generate_stub_models.py` | Regenerate stub model artifacts in `models/` | `backend/` |
 | `generate_apex2_summary.py` | Word doc: APEX2 review for management | `backend/` |
 | `apex2_comparison.py` | Compare engine vs production APEX2 spreadsheet | `backend/` |
-| `train_freddie_prepayment.py` | Train XGBoost on Freddie Mac data | `backend/` |
+| `train_freddie_prepayment.py` | Train XGBoost on Freddie Mac data (research) | `backend/` |
 | `strip_pii.py` | Remove PII from loan tapes | `backend/` |
 
 All scripts assume `source .venv/bin/activate` has been run first.
