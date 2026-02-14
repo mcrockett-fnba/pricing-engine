@@ -189,15 +189,17 @@ def stage_bucket_assignment(pkg):
 
     # For each leaf, compute KM 50%-life and mean life (area under survival curve)
     leaf_mean_life = {}  # leaf_id -> expected life (integral of survival curve)
+    leaf_curves = {}  # leaf_id -> list[float] (360 survival probabilities)
     for leaf_id in leaf_loans:
         curve = get_survival_curve(leaf_id, 360)
+        leaf_curves[leaf_id] = curve
         half_idx = next((i for i, s in enumerate(curve) if s <= 0.5), len(curve))
         leaf_km_life[leaf_id] = half_idx + 1  # 1-indexed month
         leaf_mean_life[leaf_id] = sum(curve)  # area under curve = expected life in months
 
     logger.info("  Assigned %d loans to %d leaves", len(loan_leaf_map), len(leaf_loans))
     logger.info("  Stage 3 done (%.1fs)", time.time() - t0)
-    return loan_leaf_map, dict(leaf_loans), leaf_km_life, leaf_mean_life
+    return loan_leaf_map, dict(leaf_loans), leaf_km_life, leaf_mean_life, leaf_curves
 
 
 # ===================================================================
@@ -851,7 +853,7 @@ def stage_assemble_html(
     df, pkg, loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life,
     scenarios_9, results, stub_impacts, feature_bounds, scenario_stress,
     registry=None, mc_results=None, portfolio_mc_pvs=None,
-    price_totals=None,
+    price_totals=None, leaf_curves=None,
 ):
     logger.info("Stage 7: Assembling HTML")
     now = datetime.now().strftime("%B %d, %Y %I:%M %p")
@@ -916,7 +918,7 @@ def stage_assemble_html(
     )
     section2 = _build_effective_life(
         df, leaf_loans, leaf_km_life, leaf_mean_life, loan_leaf_map, tape_plug,
-        avg_km_life, avg_mean_life, wt_avg,
+        avg_km_life, avg_mean_life, wt_avg, leaf_curves=leaf_curves,
     )
     section3 = _build_apex2_dimensional(df, wt_avg)
     section4 = _build_price_comparison(df, pt, scenario_stress, results)
@@ -924,6 +926,7 @@ def stage_assemble_html(
     section6 = _build_loan_detail(df, loan_leaf_map, leaf_km_life, results)
     section7 = _build_tree_diagram(
         loan_leaf_map, leaf_km_life, registry or ModelRegistry.get(),
+        leaf_curves=leaf_curves,
     )
 
     section8 = ""
@@ -1143,7 +1146,8 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
 
 
 def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_leaf_map,
-                           tape_plug, avg_km_life, avg_mean_life, wt_avg):
+                           tape_plug, avg_km_life, avg_mean_life, wt_avg,
+                           leaf_curves=None):
     # Portfolio summary
     summary = f"""
     <div class="life-summary">
@@ -1266,11 +1270,23 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
       The tape's 305 loans cluster into only 5 leaves, so KM metrics are shared within each leaf while APEX2 plug varies per loan.
     </div>"""
 
+    # KM survival curve chart for tape leaves
+    survival_chart = ""
+    if leaf_curves:
+        tape_curves = {lid: leaf_curves[lid] for lid in sorted(leaf_loans.keys()) if lid in leaf_curves}
+        if tape_curves:
+            survival_chart = f"""
+    <h3 class="subsection">KM Survival Curves (Tape Leaves)</h3>
+    <p class="section-hint">Each curve shows the fraction of training loans still performing at each month.
+    Dots mark the 50%-life (median payoff time). Steeper curves = faster prepayment.</p>
+    <div class="chart-container">{_survival_curve_svg(tape_curves, leaf_km_life)}</div>"""
+
     return f"""
     <h2 class="section-title">2. Effective Life Comparison</h2>
     {summary}
     {provenance}
     {note}
+    {survival_chart}
     <h3 class="subsection">Per-Leaf Comparison</h3>
     <div class="table-wrap">{leaf_table}</div>
     <h3 class="subsection">Effective Life by Leaf &mdash; Three Methods</h3>
@@ -1776,7 +1792,7 @@ def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
 # ---------------------------------------------------------------------------
 # Section 8: Segmentation Tree Diagram
 # ---------------------------------------------------------------------------
-def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
+def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry, leaf_curves=None):
     """Build an interactive top-down tree diagram with clickable leaves."""
     tree_structure = registry.tree_structure
     nested = tree_structure.get("nested_tree", {})
@@ -1845,6 +1861,15 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
         highlight = "tree-leaf-tape" if tape_n > 0 else ""
         tape_badge = f'<span class="badge badge-green">{tape_n} tape loans</span>' if tape_n > 0 else ""
 
+        # Mini survival curve for this leaf
+        mini_curve_html = ""
+        if leaf_curves and lid in leaf_curves:
+            mini_curve_html = f"""
+            <div style="margin-top:8px">
+              <div style="font-size:11px;color:#6b7280;margin-bottom:2px;font-weight:600">Survival Curve</div>
+              {_survival_curve_mini_svg(leaf_curves[lid], km_life)}
+            </div>"""
+
         leaf_panels.append(f"""
         <div class="leaf-panel {highlight}" id="leaf-panel-{lid}">
           <div class="leaf-panel-header">
@@ -1868,6 +1893,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
                 <tr><td class="stat-label">KM 50%-Life</td><td class="stat-value">{km_life} mo</td></tr>
                 <tr><td class="stat-label">Tape Loans</td><td class="stat-value">{tape_n}</td></tr>
               </table>
+              {mini_curve_html}
             </div>
           </div>
         </div>""")
@@ -2445,6 +2471,139 @@ def _mini_cashflow_svg(cash_flows, width=300, height=80):
         f'<polyline points="{" ".join(points)}" fill="none" stroke="#005C3F" stroke-width="1.5"/>'
         f'</svg>'
     )
+
+
+def _survival_curve_svg(curves: dict, leaf_km_life: dict, width=540, height=260,
+                         max_months=240, title="KM Survival Curves"):
+    """SVG line chart of survival curves for multiple leaves.
+
+    curves: {leaf_id: [prob_m1, prob_m2, ..., prob_m360]}
+    leaf_km_life: {leaf_id: 50%-life month}
+    """
+    if not curves:
+        return '<p class="muted">No survival curve data</p>'
+
+    pad_l, pad_r, pad_t, pad_b = 50, 20, 30, 40
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
+
+    def tx(month):
+        return pad_l + (month / max_months) * pw
+
+    def ty(prob):
+        return pad_t + (1 - prob) * ph
+
+    lines = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" style="font-family:Inter,system-ui,sans-serif">']
+
+    # Background
+    lines.append(f'<rect width="{width}" height="{height}" fill="#fafafa" rx="4"/>')
+
+    # Title
+    lines.append(f'<text x="{width/2}" y="16" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">{title}</text>')
+
+    # Grid lines and Y-axis labels
+    for prob in [0, 0.25, 0.5, 0.75, 1.0]:
+        y = ty(prob)
+        lines.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width-pad_r}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="0.5"/>')
+        lines.append(f'<text x="{pad_l-4}" y="{y+3:.1f}" text-anchor="end" font-size="10" fill="#9ca3af">{prob:.0%}</text>')
+
+    # 50% dashed reference
+    y50 = ty(0.5)
+    lines.append(f'<line x1="{pad_l}" y1="{y50:.1f}" x2="{width-pad_r}" y2="{y50:.1f}" stroke="#9ca3af" stroke-width="0.8" stroke-dasharray="4,3"/>')
+
+    # X-axis labels (every 60 months = 5 years)
+    for m in range(0, max_months + 1, 60):
+        x = tx(m)
+        lines.append(f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{height-pad_b}" stroke="#e5e7eb" stroke-width="0.5"/>')
+        lines.append(f'<text x="{x:.1f}" y="{height-pad_b+14}" text-anchor="middle" font-size="10" fill="#9ca3af">{m}mo ({m//12}yr)</text>')
+
+    # Axis labels
+    lines.append(f'<text x="{width/2}" y="{height-4}" text-anchor="middle" font-size="10" fill="#6b7280">Months Since Origination</text>')
+
+    # Curve colors — distinct palette
+    palette = ["#005C3F", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#65a30d"]
+    sorted_leaves = sorted(curves.keys())
+
+    legend_items = []
+    for i, leaf_id in enumerate(sorted_leaves):
+        curve = curves[leaf_id]
+        color = palette[i % len(palette)]
+        km_life = leaf_km_life.get(leaf_id, 0)
+
+        # Build polyline — sample every 2 months for smoother rendering
+        pts = []
+        for m in range(0, min(max_months, len(curve)), 2):
+            pts.append(f"{tx(m+1):.1f},{ty(curve[m]):.1f}")
+        if pts:
+            lines.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2" opacity="0.85"/>')
+
+        # Mark 50%-life crossing with a dot
+        if km_life <= max_months:
+            cx = tx(km_life)
+            cy = ty(0.5)
+            lines.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{color}" stroke="white" stroke-width="1.5"/>')
+            lines.append(f'<text x="{cx+6:.1f}" y="{cy-6:.1f}" font-size="9" fill="{color}" font-weight="600">{km_life}mo</text>')
+
+        legend_items.append(f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">'
+                            f'<span style="width:14px;height:3px;background:{color};display:inline-block;border-radius:1px"></span>'
+                            f'<span style="font-size:11px;color:#374151">Leaf {leaf_id} (50%={km_life}mo)</span></span>')
+
+    lines.append('</svg>')
+    svg = "\n".join(lines)
+
+    legend_html = f'<div style="margin-top:6px;line-height:1.8">{"".join(legend_items)}</div>'
+    return svg + legend_html
+
+
+def _survival_curve_mini_svg(curve: list, km_life: int, width=220, height=100):
+    """Compact single-curve SVG for leaf detail panels."""
+    if not curve:
+        return ""
+
+    max_months = min(240, len(curve))
+    pad_l, pad_r, pad_t, pad_b = 30, 8, 8, 20
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
+
+    def tx(m):
+        return pad_l + (m / max_months) * pw
+
+    def ty(p):
+        return pad_t + (1 - p) * ph
+
+    lines = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" style="font-family:Inter,system-ui,sans-serif">']
+    lines.append(f'<rect width="{width}" height="{height}" fill="#f9fafb" rx="3"/>')
+
+    # Y-axis: 0%, 50%, 100%
+    for prob, label in [(1.0, "100%"), (0.5, "50%"), (0.0, "0%")]:
+        y = ty(prob)
+        lines.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width-pad_r}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="0.5"/>')
+        lines.append(f'<text x="{pad_l-3}" y="{y+3:.1f}" text-anchor="end" font-size="8" fill="#9ca3af">{label}</text>')
+
+    # 50% dashed
+    y50 = ty(0.5)
+    lines.append(f'<line x1="{pad_l}" y1="{y50:.1f}" x2="{width-pad_r}" y2="{y50:.1f}" stroke="#9ca3af" stroke-width="0.5" stroke-dasharray="3,2"/>')
+
+    # Curve
+    pts = []
+    for m in range(0, max_months, 2):
+        pts.append(f"{tx(m+1):.1f},{ty(curve[m]):.1f}")
+    if pts:
+        lines.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#005C3F" stroke-width="1.5"/>')
+
+    # 50%-life marker
+    if km_life <= max_months:
+        cx, cy = tx(km_life), ty(0.5)
+        lines.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="#005C3F" stroke="white" stroke-width="1"/>')
+
+    # X labels
+    for m in [0, 60, 120, 180, 240]:
+        if m <= max_months:
+            x = tx(m)
+            lines.append(f'<text x="{x:.1f}" y="{height-6}" text-anchor="middle" font-size="8" fill="#9ca3af">{m}</text>')
+
+    lines.append('</svg>')
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -3252,7 +3411,7 @@ def main():
     registry = stage_init_models()
 
     # Stage 3: Bucket assignment
-    loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life = stage_bucket_assignment(pkg)
+    loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life, leaf_curves = stage_bucket_assignment(pkg)
 
     # Stage 4: APEX2 analysis
     df, scenarios_9 = stage_apex2_analysis(df)
@@ -3279,7 +3438,7 @@ def main():
         df, pkg, loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life,
         scenarios_9, results, stub_impacts, feature_bounds, scenario_stress,
         registry=registry, mc_results=mc_results, portfolio_mc_pvs=portfolio_mc_pvs,
-        price_totals=price_totals,
+        price_totals=price_totals, leaf_curves=leaf_curves,
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)
