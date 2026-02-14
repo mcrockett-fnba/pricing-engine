@@ -6,6 +6,30 @@ from pydantic import BaseModel
 from app.models.simulation import SimulationConfig
 
 
+class ModelProvenance(BaseModel):
+    """Tracks which model/track produced a valuation result."""
+    track: str
+    track_a_version: Optional[str] = None
+    track_b_version: Optional[str] = None
+    prepayment_source: Optional[str] = None
+    credit_model: Optional[str] = None
+    discount_method: Optional[str] = None
+    discount_rate_annual: Optional[float] = None
+
+
+class CalibrationMetrics(BaseModel):
+    """Calibration comparison between Track A and Track B."""
+    track_a_pv: Optional[float] = None
+    track_b_pv: Optional[float] = None
+    absolute_error: Optional[float] = None
+    relative_error_pct: Optional[float] = None
+    roe_a: Optional[float] = None
+    roe_b: Optional[float] = None
+    roe_diff_bps: Optional[float] = None
+    within_tolerance: Optional[bool] = None
+    tolerance_threshold_pct: Optional[float] = None
+
+
 class MonthlyCashFlow(BaseModel):
     """Projected cash flow for a single month."""
     month: int
@@ -34,6 +58,8 @@ class LoanValuationResult(BaseModel):
     pv_percentiles: dict[str, float]
     monthly_cash_flows: list[MonthlyCashFlow]
     model_status: dict[str, str]
+    provenance: Optional[ModelProvenance] = None
+    calibration: Optional[CalibrationMetrics] = None
 
 
 class PackageValuationResult(BaseModel):
@@ -56,3 +82,6 @@ class PackageValuationResult(BaseModel):
     simulation_config: SimulationConfig
     model_manifest: dict
     computed_at: datetime
+    provenance: Optional[ModelProvenance] = None
+    calibration_summary: Optional[CalibrationMetrics] = None
+    tolerance_gate_passed: Optional[bool] = None

@@ -249,6 +249,82 @@ def test_portfolio_npv_sum_of_parts():
     )
 
 
+# ---------------------------------------------------------------------------
+# Track A / Dual-track invariants
+# ---------------------------------------------------------------------------
+
+
+def test_track_a_survival_monotonically_decreasing():
+    """Track A survival (CDR-driven) must be monotonically decreasing."""
+    from app.models.simulation import TrackAConfig
+    from app.services.track_a_valuation import track_a_loan_pv
+
+    loan = _make_loan(remaining_term=120)
+    cfg = TrackAConfig()
+    _, cfs = track_a_loan_pv(loan, cfg)
+    for i in range(1, len(cfs)):
+        assert cfs[i].survival_probability <= cfs[i - 1].survival_probability, (
+            f"Track A survival increased at month {cfs[i].month}: "
+            f"{cfs[i - 1].survival_probability} -> {cfs[i].survival_probability}"
+        )
+
+
+def test_track_a_net_cf_equals_components():
+    """Track A net_cf == expected_payment - expected_loss - servicing_cost."""
+    from app.models.simulation import TrackAConfig
+    from app.services.track_a_valuation import track_a_loan_pv
+
+    loan = _make_loan(remaining_term=60)
+    cfg = TrackAConfig()
+    _, cfs = track_a_loan_pv(loan, cfg)
+    for cf in cfs:
+        expected = (cf.expected_payment + cf.expected_prepayment
+                    - cf.expected_loss + cf.expected_recovery
+                    - cf.servicing_cost)
+        assert abs(cf.net_cash_flow - round(expected, 2)) <= 0.02, (
+            f"Track A net CF mismatch at month {cf.month}: "
+            f"net_cf={cf.net_cash_flow}, components={expected:.2f}"
+        )
+
+
+def test_dual_track_both_pv_positive():
+    """Both Track A and Track B should produce positive PV for a performing loan."""
+    from app.models.simulation import TrackAConfig, ValuationTrack
+    from app.services.dual_track_service import valuate_loan
+
+    loan = _make_loan(remaining_term=120)
+    config = SimulationConfig(
+        n_simulations=0, include_stochastic=False,
+        track=ValuationTrack.both,
+        track_a_config=TrackAConfig(),
+    )
+    result = valuate_loan(loan, config)
+    assert result.expected_pv > 0, f"Track B PV should be positive: {result.expected_pv}"
+    assert result.calibration is not None
+    assert result.calibration.track_a_pv > 0, f"Track A PV should be positive: {result.calibration.track_a_pv}"
+    assert result.calibration.track_b_pv > 0, f"Track B PV should be positive: {result.calibration.track_b_pv}"
+
+
+def test_provenance_always_present_when_track_set():
+    """Provenance should always be populated when track is explicitly set."""
+    from app.models.simulation import TrackAConfig, ValuationTrack
+    from app.services.dual_track_service import valuate_loan
+
+    loan = _make_loan(remaining_term=60)
+
+    for track in [ValuationTrack.A, ValuationTrack.B, ValuationTrack.both]:
+        config = SimulationConfig(
+            n_simulations=0, include_stochastic=False,
+            track=track,
+            track_a_config=TrackAConfig(),
+        )
+        result = valuate_loan(loan, config)
+        assert result.provenance is not None, f"Provenance missing for track={track}"
+        assert result.provenance.track in ("A", "B"), (
+            f"Unexpected provenance track: {result.provenance.track}"
+        )
+
+
 def test_mc_distribution_not_sorted():
     """pv_distribution preserves simulation-path insertion order, not sorted order.
 

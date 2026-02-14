@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from app.models.package import Package
 from app.models.simulation import SimulationConfig
 from app.models.valuation import PackageValuationResult
-from app.services.simulation_service import run_valuation
+from app.services.dual_track_service import valuate_package
 
 router = APIRouter(tags=["valuation"])
 
@@ -25,4 +25,4 @@ def run_valuation_endpoint(request: ValuationRequest):
     Returns NPV, ROE, scenario analysis, and Monte Carlo distributions.
     """
     config = request.config or SimulationConfig()
-    return run_valuation(request.package, config)
+    return valuate_package(request.package, config)
