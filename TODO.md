@@ -61,21 +61,32 @@ FNBA's THR re-analysis priced the tape $3.8M below Offered ($80.7M → ~$76.9M) 
 
 **Implementation approach — recompute KM curves, keep tree structure:**
 
-- [ ] 1.5.1 **Add `--lookback-months N` flag to `train_segmentation_tree.py`** — Filter training observations: only include loans where `payoff_date >= cutoff` or `last_observation_date >= cutoff` (still performing recently). Censored loans that went silent >N months ago are excluded. The Freddie CSV has `noteDateYear` but may need `last_obs_date` derived from `time + origination_date`. Check if FNBA data has observation dates. If not, filter by `noteDateYear + time >= cutoff_year`.
-- [ ] 1.5.2 **Recompute KM curves only (keep tree fixed)** — The 75-leaf tree structure stays the same (loan routing doesn't change). Only re-run `compute_leaf_survival_curves()` on the filtered subset. This is the fast path: ~30s instead of retraining the full tree (~100s). Save to `models/survival/survival_curves_12mo.parquet` alongside the full-history version.
-- [ ] 1.5.3 **Model versioning in manifest.json** — Add a `curve_variant` field: `"full_history"` (current) vs `"12mo_lookback"`. The `ModelRegistry` loads whichever variant is configured. Structure: `models/survival/survival_curves.parquet` (default, full history) + `models/survival/survival_curves_12mo.parquet`.
-- [ ] 1.5.4 **Add `--curve-variant` flag to `pricing_validation_report.py`** — Run the report with either curve set. The report header should show which variant was used. Default: `full_history`.
-- [ ] 1.5.5 **Generate V2 (12mo lookback) report** — Run with `--curve-variant 12mo_lookback`, save to `reports/v2_12mo_lookback/`. Compare portfolio price delta vs V1. Target: explain the $3.8M gap.
-- [ ] 1.5.6 **Side-by-side comparison** — Add a section to the report (or a standalone script) that overlays V1 vs V2 KM curves for the 5 tape leaves, shows the life delta, and translates to a price delta. This is the CIO deliverable: "here's what the 12-month lookback does and why the price dropped."
+- [x] 1.5.1 **Add `--lookback-months N` flag to `train_segmentation_tree.py`** — Filters by `last_obs_year = noteDateYear + time/12 >= cutoff`. 12mo filter: 4.4M → 632K loans (13K payoffs, 619K censored). 85.7% dropped.
+- [x] 1.5.2 **Recompute KM curves only (keep tree fixed)** — `--curves-only` flag skips tree training, loads existing .pkl. Curves saved to `survival_curves_12mo.parquet`. ~48s vs ~100s for full retrain.
+- [x] 1.5.3 **Model versioning in manifest.json** — `curve_variants` dict in manifest. `ModelRegistry.load_curve_variant("12mo")` method swaps curves at runtime.
+- [x] 1.5.4 **Add `--curve-variant` flag to `pricing_validation_report.py`** — `--curve-variant 12mo` loads variant curves. Report header shows "Curves: 12mo Lookback".
+- [x] 1.5.5 **Generate V2 (12mo lookback) report** — Saved to `reports/v2_12mo_lookback/`.
+- [x] 1.5.6 **Side-by-side comparison** — `curve_comparison_report.py`: per-leaf SVG overlays, life delta table, PV sensitivity estimate. Tape routes to 5 leaves: 42, 43, 44, 69, 75.
+- [ ] 1.5.7 **Use KM as sole prepay model** — Current engine architecture limits KM impact (see finding below).
 
-**Key questions to resolve:**
-- Does the Freddie CSV have enough date granularity to filter by observation recency? (`noteDateYear` + `time` gives approximate last-observation year, but monthly precision requires `origination_month`.)
-- Should the tree itself be retrained on recent data, or just the curves? (Curves only is faster and more defensible — same segmentation, different prepay assumptions.)
-- What's the right lookback: 12 months? 24? Should we parameterize and show sensitivity?
+> **Status**: 1.5.1–1.5.5 complete. V2 report generated but PE price delta is only $174K (+0.2%), not $3.8M.
+
+**Critical finding — why the delta is small:**
+
+The engine uses KM survival curves as an `marginal_default` (all-causes hazard) overlay on top of a separate stub prepayment model. Both reduce the surviving pool independently:
+```
+cumulative_survival *= (1 - marginal_default_from_KM) * (1 - marginal_prepay_from_stub)
+```
+Switching to 12mo lookback flattens the KM curves (hazard → 0), but the stub prepay model continues generating prepay cash flows unchanged. Result: PE price barely moves.
+
+**To replicate the THR $3.8M gap**, the engine must use KM survival as the SOLE exit model:
+- Option A: Derive prepay SMM from KM hazard, replace stub prepay entirely
+- Option B: Set `marginal_default = CDR only` and `marginal_prepay = KM hazard - CDR`
+- Option C: Full competing-risk decomposition (Phase 3)
 
 **Versioned outputs:**
-- `reports/v1_full_history/` — current model (captured 2026-02-14)
-- `reports/v2_12mo_lookback/` — THR-comparable (to be generated)
+- `reports/v1_full_history/` — full-history curves (captured 2026-02-14)
+- `reports/v2_12mo_lookback/` — 12mo lookback curves (2026-02-14)
 
 ---
 

@@ -853,7 +853,7 @@ def stage_assemble_html(
     df, pkg, loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life,
     scenarios_9, results, stub_impacts, feature_bounds, scenario_stress,
     registry=None, mc_results=None, portfolio_mc_pvs=None,
-    price_totals=None, leaf_curves=None,
+    price_totals=None, leaf_curves=None, curve_variant_label="Full History",
 ):
     logger.info("Stage 7: Assembling HTML")
     now = datetime.now().strftime("%B %d, %Y %I:%M %p")
@@ -935,7 +935,7 @@ def stage_assemble_html(
 
     section9 = _build_assumptions_tab(df, wt_avg)
 
-    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8, section9)
+    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8, section9, curve_variant_label=curve_variant_label)
     return page
 
 
@@ -2740,7 +2740,7 @@ def _build_assumptions_tab(df, wt_avg):
 # ---------------------------------------------------------------------------
 # Page assembly
 # ---------------------------------------------------------------------------
-def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8="", section9=""):
+def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8="", section9="", curve_variant_label="Full History"):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3251,6 +3251,7 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     <h1>Pricing Validation Report</h1>
     <div class="subtitle">
       FNBA Loan Tape Analysis &bull; Generated {now}
+      &bull; Curves: <strong>{curve_variant_label}</strong>
     </div>
   </div>
 
@@ -3393,6 +3394,11 @@ def main():
                         help="Number of MC simulations per loan (default: 200)")
     parser.add_argument("--no-csv", action="store_true",
                         help="Skip CSV export")
+    parser.add_argument("--curve-variant", type=str, default=None, metavar="VARIANT",
+                        help=(
+                            "Survival curve variant to use. E.g. '12mo' loads "
+                            "survival_curves_12mo.parquet. Default: full history."
+                        ))
     args = parser.parse_args()
 
     run_mc = args.mc and not args.no_mc
@@ -3409,6 +3415,14 @@ def main():
 
     # Stage 2: Init models
     registry = stage_init_models()
+
+    # Load curve variant if specified
+    curve_variant_label = "Full History"
+    if args.curve_variant:
+        registry.load_curve_variant(args.curve_variant)
+        curve_variant_label = f"{args.curve_variant} Lookback"
+        logger.info("Using curve variant: %s (%d curves loaded)",
+                     args.curve_variant, len(registry.survival_curves))
 
     # Stage 3: Bucket assignment
     loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life, leaf_curves = stage_bucket_assignment(pkg)
@@ -3439,6 +3453,7 @@ def main():
         scenarios_9, results, stub_impacts, feature_bounds, scenario_stress,
         registry=registry, mc_results=mc_results, portfolio_mc_pvs=portfolio_mc_pvs,
         price_totals=price_totals, leaf_curves=leaf_curves,
+        curve_variant_label=curve_variant_label,
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)

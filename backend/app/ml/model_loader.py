@@ -218,6 +218,60 @@ class ModelRegistry:
             if self.state_group_mapping:
                 logger.info("Loaded %d state group mappings", len(self.state_group_mapping))
 
+    def load_curve_variant(self, variant: str) -> None:
+        """Reload survival curves from a named variant parquet file.
+
+        Args:
+            variant: e.g. "12mo" loads survival_curves_12mo.parquet,
+                     "full" or "" loads survival_curves.parquet (default).
+        """
+        if self._model_dir is None:
+            logger.warning("Cannot load curve variant — model_dir not set")
+            return
+
+        if variant and variant != "full":
+            parquet_name = f"survival_curves_{variant}.parquet"
+        else:
+            parquet_name = "survival_curves.parquet"
+
+        parquet_path = self._model_dir / "survival" / parquet_name
+        if not parquet_path.is_file():
+            logger.error("Curve variant file not found: %s", parquet_path)
+            return
+
+        # Clear existing curves and reload from variant
+        self.survival_curves.clear()
+        self._active_curve_variant = variant or "full"
+
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(str(parquet_path))
+            bucket_ids = table.column("bucket_id").to_pylist()
+            months = table.column("month").to_pylist()
+            probs = table.column("survival_prob").to_pylist()
+
+            curves: dict[int, list[tuple[int, float]]] = {}
+            for bid, m, p in zip(bucket_ids, months, probs):
+                curves.setdefault(bid, []).append((m, p))
+
+            for bid, pairs in curves.items():
+                pairs.sort(key=lambda x: x[0])
+                self.survival_curves[bid] = [p for _, p in pairs]
+
+            logger.info(
+                "Loaded curve variant '%s': %d buckets from %s",
+                self._active_curve_variant,
+                len(self.survival_curves),
+                parquet_path,
+            )
+        except Exception as e:
+            logger.warning("Failed to load curve variant '%s': %s", variant, e)
+
+    @property
+    def active_curve_variant(self) -> str:
+        """Return the currently loaded curve variant name."""
+        return getattr(self, "_active_curve_variant", "full")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

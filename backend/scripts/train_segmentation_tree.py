@@ -12,10 +12,19 @@ Produces:
 Usage:
   cd backend
   source .venv/bin/activate
+
+  # Full training (tree + curves on all data):
   python scripts/train_segmentation_tree.py
+
+  # Recompute KM curves only (keep existing tree), with 12-month lookback:
+  python scripts/train_segmentation_tree.py --curves-only --lookback-months 12
+
+  # 24-month lookback, curves only:
+  python scripts/train_segmentation_tree.py --curves-only --lookback-months 24
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -161,6 +170,41 @@ def blend_data(fnba: pd.DataFrame, freddie: pd.DataFrame) -> pd.DataFrame:
 
     logger.info("Blended dataset: %d total loans", len(df))
     return df
+
+
+# ===================================================================
+# Step 1b: Lookback filter for KM curve recomputation
+# ===================================================================
+def apply_lookback_filter(df: pd.DataFrame, lookback_months: int) -> pd.DataFrame:
+    """Filter training data to loans observed within the lookback window.
+
+    Computes approximate last-observation year as noteDateYear + time/12.
+    Keeps loans where last_obs >= cutoff, where cutoff = max(last_obs) - lookback_months/12.
+
+    This filters OUT loans that went silent (censored or paid off) before the
+    lookback window.  Loans still alive recently are kept even if they originated
+    long ago — the KM estimator handles their censoring correctly.
+    """
+    df = df.copy()
+    df["_last_obs_year"] = df["noteDateYear"] + df["time"] / 12.0
+    max_obs = df["_last_obs_year"].max()
+    cutoff = max_obs - lookback_months / 12.0
+
+    before = len(df)
+    df_filtered = df[df["_last_obs_year"] >= cutoff].copy()
+    df_filtered.drop(columns=["_last_obs_year"], inplace=True)
+
+    n_payoffs = (df_filtered["event"] == 1).sum()
+    n_censored = (df_filtered["event"] == 0).sum()
+    logger.info(
+        "Lookback filter: %d months (cutoff=%.1f). %d → %d loans "
+        "(%d payoffs, %d censored). Dropped %d (%.1f%%)",
+        lookback_months, cutoff, before, len(df_filtered),
+        n_payoffs, n_censored,
+        before - len(df_filtered),
+        (before - len(df_filtered)) / before * 100,
+    )
+    return df_filtered
 
 
 # ===================================================================
@@ -553,8 +597,48 @@ def save_metadata(
 # ===================================================================
 # Main
 # ===================================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train segmentation tree and/or recompute KM survival curves.",
+    )
+    parser.add_argument(
+        "--curves-only",
+        action="store_true",
+        help="Skip tree training. Load existing tree and recompute KM curves only.",
+    )
+    parser.add_argument(
+        "--lookback-months",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Only include loans observed within the last N months for KM curve "
+            "computation. Saves to survival_curves_{N}mo.parquet alongside the "
+            "full-history curves. Requires --curves-only."
+        ),
+    )
+    return parser.parse_args()
+
+
+def _build_node_to_leaf(tree: DecisionTreeRegressor) -> dict[int, int]:
+    """Build node_id → sequential leaf_id mapping from a fitted tree."""
+    t = tree.tree_
+    node_to_leaf: dict[int, int] = {}
+    leaf_id_counter = 0
+    for node_id in range(t.node_count):
+        if t.children_left[node_id] == t.children_right[node_id]:
+            leaf_id_counter += 1
+            node_to_leaf[node_id] = leaf_id_counter
+    return node_to_leaf
+
+
 def main():
+    args = parse_args()
     start = _time.time()
+
+    if args.lookback_months is not None and not args.curves_only:
+        logger.warning("--lookback-months implies --curves-only; enabling it.")
+        args.curves_only = True
 
     # Verify data files exist
     for p in [FNBA_PATH, FREDDIE_PATH]:
@@ -579,98 +663,210 @@ def main():
     # Step 2: Pre-bin states
     df, state_mapping = bin_states(df)
 
-    # Step 3: Train tree
-    tree = train_tree(df)
+    if args.curves_only:
+        # ----------------------------------------------------------
+        # Curves-only path: load existing tree, recompute KM curves
+        # ----------------------------------------------------------
+        tree_path = SEG_DIR / "segmentation_tree.pkl"
+        if not tree_path.is_file():
+            logger.error("No existing tree found at %s. Run without --curves-only first.", tree_path)
+            sys.exit(1)
 
-    # Get leaf assignments for all loans
-    leaf_assignments = tree.apply(df[FEATURE_COLS].values)
+        logger.info("Loading existing tree from %s", tree_path)
+        tree = joblib.load(tree_path)
+        node_to_leaf = _build_node_to_leaf(tree)
 
-    # Build node_to_leaf mapping
-    node_to_leaf: dict[int, int] = {}
-    leaf_id_counter = 0
-    t = tree.tree_
-    for node_id in range(t.node_count):
-        if t.children_left[node_id] == t.children_right[node_id]:
-            leaf_id_counter += 1
-            node_to_leaf[node_id] = leaf_id_counter
+        # Apply tree to get leaf assignments (on full data, same routing)
+        leaf_assignments = tree.apply(df[FEATURE_COLS].values)
 
-    # Step 4: Extract rules
-    tree_structure = extract_tree_structure(tree, FEATURE_COLS)
-    tree_structure["state_group_mapping"] = state_mapping
+        # Apply lookback filter to the data used for KM computation
+        km_df = df
+        if args.lookback_months is not None:
+            km_df = apply_lookback_filter(df, args.lookback_months)
+            # Re-apply tree to filtered data for leaf assignment alignment
+            km_leaf_assignments = tree.apply(km_df[FEATURE_COLS].values)
+        else:
+            km_leaf_assignments = leaf_assignments
 
-    # Add per-leaf source breakdown to flat leaves
-    for leaf in tree_structure["leaves"]:
-        node_id = leaf["node_id"]
-        mask = leaf_assignments == node_id
-        leaf_df = df[mask]
-        leaf["n_fnba"] = int((leaf_df["source"] == "fnba").sum())
-        leaf["n_freddie"] = int((leaf_df["source"] == "freddie").sum())
-        leaf["n_payoffs"] = int((leaf_df["event"] == 1).sum())
-        leaf["n_censored"] = int((leaf_df["event"] == 0).sum())
-        leaf["median_time"] = round(float(leaf_df["time"].median()), 1)
+        # Recompute KM curves on (possibly filtered) data
+        curves = compute_leaf_survival_curves(km_df, km_leaf_assignments, node_to_leaf)
 
-    # Step 5: KM survival curves
-    curves = compute_leaf_survival_curves(df, leaf_assignments, node_to_leaf)
+        # Determine output filename
+        if args.lookback_months is not None:
+            out_name = f"survival_curves_{args.lookback_months}mo.parquet"
+        else:
+            out_name = "survival_curves.parquet"
+        save_survival_parquet(curves, SURVIVAL_DIR / out_name)
 
-    # Step 6: Store training loan membership
-    store_leaf_loans(df, leaf_assignments, node_to_leaf, LEAF_DIR)
-
-    # Step 7: Save artifacts
-    # Tree pickle
-    tree_path = SEG_DIR / "segmentation_tree.pkl"
-    joblib.dump(tree, tree_path)
-    logger.info("Saved tree to %s", tree_path)
-
-    # Tree structure JSON
-    structure_path = SEG_DIR / "tree_structure.json"
-    structure_path.write_text(json.dumps(tree_structure, indent=2, default=str) + "\n")
-    logger.info("Saved tree structure to %s", structure_path)
-
-    # Survival curves parquet
-    save_survival_parquet(curves, SURVIVAL_DIR / "survival_curves.parquet")
-
-    # Metadata
-    save_metadata(
-        SEG_DIR,
-        n_fnba=n_fnba,
-        n_freddie=n_freddie,
-        n_leaves=tree.get_n_leaves(),
-        tree_depth=tree.get_depth(),
-        state_mapping=state_mapping,
-    )
-
-    # Manifest
-    update_manifest(MODEL_DIR / "manifest.json")
-
-    elapsed = _time.time() - start
-    logger.info(
-        "Done in %.1fs. %d leaves trained on %d loans (%d FNBA + %d Freddie)",
-        elapsed,
-        tree.get_n_leaves(),
-        len(df),
-        n_fnba,
-        n_freddie,
-    )
-
-    # Print summary
-    print("\n" + "=" * 60)
-    print(f"Segmentation Tree Summary")
-    print(f"  Leaves:    {tree.get_n_leaves()}")
-    print(f"  Depth:     {tree.get_depth()}")
-    print(f"  FNBA:      {n_fnba:,} loans")
-    print(f"  Freddie:   {n_freddie:,} loans")
-    print(f"  Total:     {len(df):,} loans")
-    print(f"\nLeaf breakdown:")
-    for leaf in sorted(tree_structure["leaves"], key=lambda x: x["leaf_id"]):
-        print(
-            f"  Leaf {leaf['leaf_id']:3d}: "
-            f"{leaf['samples']:8,} loans "
-            f"(FNBA:{leaf['n_fnba']:6,} Freddie:{leaf['n_freddie']:7,}) "
-            f"mean={leaf['mean_time']:5.1f}mo "
-            f"median={leaf['median_time']:5.1f}mo  "
-            f"{leaf['label']}"
+        # Update manifest with curve variant info
+        _update_manifest_curve_variant(
+            MODEL_DIR / "manifest.json",
+            lookback_months=args.lookback_months,
+            n_loans_km=len(km_df),
+            n_payoffs_km=int((km_df["event"] == 1).sum()),
+            n_censored_km=int((km_df["event"] == 0).sum()),
         )
-    print("=" * 60)
+
+        elapsed = _time.time() - start
+        n_leaves = len(node_to_leaf)
+        logger.info(
+            "Curves-only done in %.1fs. %d leaves, KM on %d loans%s",
+            elapsed,
+            n_leaves,
+            len(km_df),
+            f" (lookback={args.lookback_months}mo)" if args.lookback_months else "",
+        )
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("KM Curve Recomputation Summary")
+        if args.lookback_months:
+            print(f"  Mode:      {args.lookback_months}-month lookback")
+            print(f"  Output:    {out_name}")
+        else:
+            print(f"  Mode:      Full history (recomputed)")
+        print(f"  Leaves:    {n_leaves}")
+        print(f"  KM loans:  {len(km_df):,} ({(km_df['event']==1).sum():,} payoffs, {(km_df['event']==0).sum():,} censored)")
+        print(f"  Full data: {len(df):,} loans")
+
+        # Per-leaf summary: show curve stats
+        print(f"\nPer-leaf KM life estimates:")
+        for leaf_id in sorted(curves.keys()):
+            curve = curves[leaf_id]
+            # Find month where survival drops below 50%
+            life_50 = next((m + 1 for m, s in enumerate(curve) if s < 0.5), 360)
+            # Mean life = integral of survival curve
+            mean_life = round(float(np.sum(curve)), 1)
+            # Count loans in this leaf
+            n_in_leaf = int((km_leaf_assignments == [nid for nid, lid in node_to_leaf.items() if lid == leaf_id][0]).sum())
+            print(f"  Leaf {leaf_id:3d}: {n_in_leaf:8,} loans  50%-life={life_50:3d}mo  mean-life={mean_life:6.1f}mo  S(60)={curve[59]:.3f}")
+        print("=" * 60)
+
+    else:
+        # ----------------------------------------------------------
+        # Full training path (original behavior)
+        # ----------------------------------------------------------
+        # Step 3: Train tree
+        tree = train_tree(df)
+
+        # Get leaf assignments for all loans
+        leaf_assignments = tree.apply(df[FEATURE_COLS].values)
+
+        # Build node_to_leaf mapping
+        node_to_leaf = _build_node_to_leaf(tree)
+
+        # Step 4: Extract rules
+        tree_structure = extract_tree_structure(tree, FEATURE_COLS)
+        tree_structure["state_group_mapping"] = state_mapping
+
+        # Add per-leaf source breakdown to flat leaves
+        for leaf in tree_structure["leaves"]:
+            node_id = leaf["node_id"]
+            mask = leaf_assignments == node_id
+            leaf_df = df[mask]
+            leaf["n_fnba"] = int((leaf_df["source"] == "fnba").sum())
+            leaf["n_freddie"] = int((leaf_df["source"] == "freddie").sum())
+            leaf["n_payoffs"] = int((leaf_df["event"] == 1).sum())
+            leaf["n_censored"] = int((leaf_df["event"] == 0).sum())
+            leaf["median_time"] = round(float(leaf_df["time"].median()), 1)
+
+        # Step 5: KM survival curves
+        curves = compute_leaf_survival_curves(df, leaf_assignments, node_to_leaf)
+
+        # Step 6: Store training loan membership
+        store_leaf_loans(df, leaf_assignments, node_to_leaf, LEAF_DIR)
+
+        # Step 7: Save artifacts
+        # Tree pickle
+        tree_path = SEG_DIR / "segmentation_tree.pkl"
+        joblib.dump(tree, tree_path)
+        logger.info("Saved tree to %s", tree_path)
+
+        # Tree structure JSON
+        structure_path = SEG_DIR / "tree_structure.json"
+        structure_path.write_text(json.dumps(tree_structure, indent=2, default=str) + "\n")
+        logger.info("Saved tree structure to %s", structure_path)
+
+        # Survival curves parquet
+        save_survival_parquet(curves, SURVIVAL_DIR / "survival_curves.parquet")
+
+        # Metadata
+        save_metadata(
+            SEG_DIR,
+            n_fnba=n_fnba,
+            n_freddie=n_freddie,
+            n_leaves=tree.get_n_leaves(),
+            tree_depth=tree.get_depth(),
+            state_mapping=state_mapping,
+        )
+
+        # Manifest
+        update_manifest(MODEL_DIR / "manifest.json")
+
+        elapsed = _time.time() - start
+        logger.info(
+            "Done in %.1fs. %d leaves trained on %d loans (%d FNBA + %d Freddie)",
+            elapsed,
+            tree.get_n_leaves(),
+            len(df),
+            n_fnba,
+            n_freddie,
+        )
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print(f"Segmentation Tree Summary")
+        print(f"  Leaves:    {tree.get_n_leaves()}")
+        print(f"  Depth:     {tree.get_depth()}")
+        print(f"  FNBA:      {n_fnba:,} loans")
+        print(f"  Freddie:   {n_freddie:,} loans")
+        print(f"  Total:     {len(df):,} loans")
+        print(f"\nLeaf breakdown:")
+        for leaf in sorted(tree_structure["leaves"], key=lambda x: x["leaf_id"]):
+            print(
+                f"  Leaf {leaf['leaf_id']:3d}: "
+                f"{leaf['samples']:8,} loans "
+                f"(FNBA:{leaf['n_fnba']:6,} Freddie:{leaf['n_freddie']:7,}) "
+                f"mean={leaf['mean_time']:5.1f}mo "
+                f"median={leaf['median_time']:5.1f}mo  "
+                f"{leaf['label']}"
+            )
+        print("=" * 60)
+
+
+def _update_manifest_curve_variant(
+    manifest_path: Path,
+    lookback_months: int | None,
+    n_loans_km: int,
+    n_payoffs_km: int,
+    n_censored_km: int,
+):
+    """Record curve variant metadata in manifest.json."""
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+    else:
+        manifest = {"version": "0.2.0", "models": {}}
+
+    # Initialize curve_variants dict if absent
+    if "curve_variants" not in manifest:
+        manifest["curve_variants"] = {}
+
+    variant_key = f"{lookback_months}mo_lookback" if lookback_months else "full_history"
+    manifest["curve_variants"][variant_key] = {
+        "file": (
+            f"survival/survival_curves_{lookback_months}mo.parquet"
+            if lookback_months
+            else "survival/survival_curves.parquet"
+        ),
+        "lookback_months": lookback_months,
+        "n_loans": n_loans_km,
+        "n_payoffs": n_payoffs_km,
+        "n_censored": n_censored_km,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    logger.info("Updated manifest curve_variants[%s] at %s", variant_key, manifest_path)
 
 
 if __name__ == "__main__":
