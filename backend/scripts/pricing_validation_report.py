@@ -75,6 +75,24 @@ FEATURE_NAMES = {
     "dti": "DTI",
 }
 
+
+def _fmt_life(km_life, mean_life=None, suffix="mo"):
+    """Format KM 50%-life for display, handling None (never crosses 50%)."""
+    if km_life is not None:
+        return f"{km_life}{suffix}"
+    if mean_life is not None:
+        return f"&gt;360 ({mean_life:.0f} mean){suffix}"
+    return f"&gt;360{suffix}"
+
+
+def _life_numeric(km_life, mean_life=None, fallback=360):
+    """Return a numeric life for calculations. Uses mean_life when 50%-life is None."""
+    if km_life is not None:
+        return km_life
+    if mean_life is not None:
+        return mean_life
+    return fallback
+
 # ---------------------------------------------------------------------------
 # Additional pricing column mapping for load_tape()
 # ---------------------------------------------------------------------------
@@ -193,8 +211,8 @@ def stage_bucket_assignment(pkg):
     for leaf_id in leaf_loans:
         curve = get_survival_curve(leaf_id, 360)
         leaf_curves[leaf_id] = curve
-        half_idx = next((i for i, s in enumerate(curve) if s <= 0.5), len(curve))
-        leaf_km_life[leaf_id] = half_idx + 1  # 1-indexed month
+        half_idx = next((i for i, s in enumerate(curve) if s < 0.5), None)
+        leaf_km_life[leaf_id] = (half_idx + 1) if half_idx is not None else None  # None = never crosses 50%
         leaf_mean_life[leaf_id] = sum(curve)  # area under curve = expected life in months
 
     logger.info("  Assigned %d loans to %d leaves", len(loan_leaf_map), len(leaf_loans))
@@ -892,8 +910,10 @@ def stage_assemble_html(
     for _, row in df.iterrows():
         lid = f"LN-{int(_ + 1):04d}"
         leaf = loan_leaf_map.get(lid, 0)
-        km_lives.append(leaf_km_life.get(leaf, 120))
-        mean_lives.append(leaf_mean_life.get(leaf, 120))
+        mean_life = leaf_mean_life.get(leaf, 120)
+        km_life = leaf_km_life.get(leaf)
+        km_lives.append(_life_numeric(km_life, mean_life))
+        mean_lives.append(mean_life)
     df["km_life"] = km_lives
     df["engine_mean_life"] = mean_lives
     avg_km_life = wt_avg(pd.Series(km_lives, index=df.index))
@@ -1069,7 +1089,7 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
       {_traffic_light_svg("Features In Bounds", avg_in_bounds, (90, 75), "%")}
     </div>
     <div style="font-size:12px;color:#6b7280;margin-top:8px">
-      Sub-models: {n_total - n_stub}/{n_total} real | Life: APEX2 {tape_plug:.0f}mo vs KM {avg_km_life:.0f}mo vs Mean {avg_mean_life:.0f}mo
+      Sub-models: {n_total - n_stub}/{n_total} real | Life: APEX2 {tape_plug:.0f}mo vs Mean {avg_mean_life:.0f}mo (KM 50%: {avg_km_life:.0f}mo)
     </div>"""
 
     # --- ROE summary row ---
@@ -1103,7 +1123,7 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     <div class="info-callout" style="margin-top:12px">
       <strong>Price spread:</strong> PPD_OLD is {spread_pct:.1f}% {direction} Offered
       &bull; APEX2 is {abs(apex2_vs_offered - 1.0) * 100:.1f}% {"above" if apex2_vs_offered >= 1.0 else "below"} Offered
-      &bull; Prepay life gap: tape {tape_plug:.0f}mo vs KM {avg_km_life:.0f}mo ({life_divergence:.0f}%)
+      &bull; Prepay life: APEX2 {tape_plug:.0f}mo vs KM mean {avg_mean_life:.0f}mo ({life_divergence:.0f}% gap)
       &bull; {n_total - n_stub}/{n_total} sub-models real
     </div>"""
 
@@ -1167,15 +1187,17 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
         loans_in_leaf = leaf_loans[leaf_id]
         n_loans = len(loans_in_leaf)
         leaf_upb = sum(l.get("unpaid_balance", 0) for l in loans_in_leaf)
-        km_life = leaf_km_life.get(leaf_id, 0)
+        km_life_raw = leaf_km_life.get(leaf_id)
+        mean_life = leaf_mean_life.get(leaf_id, 0)
+        km_life_num = _life_numeric(km_life_raw, mean_life)
+        km_life_display = _fmt_life(km_life_raw, mean_life, suffix="")
 
         # Get tape amort plugs for loans in this leaf
         leaf_loan_ids = {l.get("loan_id") for l in loans_in_leaf}
         leaf_df = df[df.index.map(lambda i: f"LN-{i+1:04d}" in leaf_loan_ids)]
 
         tape_plug_leaf = leaf_df["apex2_amort_plug"].mean() if "apex2_amort_plug" in leaf_df.columns and len(leaf_df) > 0 else 0
-        mean_life = leaf_mean_life.get(leaf_id, 0)
-        divergence = abs(tape_plug_leaf - km_life) / tape_plug_leaf * 100 if tape_plug_leaf > 0 else 0
+        divergence = abs(tape_plug_leaf - km_life_num) / tape_plug_leaf * 100 if tape_plug_leaf > 0 else 0
 
         div_class = "green" if divergence <= 15 else ("yellow" if divergence <= 30 else "red")
 
@@ -1185,7 +1207,7 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
           <td class="num">{n_loans}</td>
           <td class="num">${leaf_upb:,.0f}</td>
           <td class="num">{tape_plug_leaf:.0f}</td>
-          <td class="num">{km_life}</td>
+          <td class="num">{km_life_display}</td>
           <td class="num">{mean_life:.0f}</td>
           <td class="num"><span class="badge badge-{div_class}">{divergence:.0f}%</span></td>
         </tr>""")
@@ -1205,24 +1227,26 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
         loans_in_leaf = leaf_loans[leaf_id]
         n_loans = len(loans_in_leaf)
         leaf_upb = sum(l.get("unpaid_balance", 0) for l in loans_in_leaf)
-        km_life = leaf_km_life.get(leaf_id, 0)
+        km_life_raw = leaf_km_life.get(leaf_id)
         mean_life = leaf_mean_life.get(leaf_id, 0)
+        km_life_num = _life_numeric(km_life_raw, mean_life)
+        km_life_display = _fmt_life(km_life_raw, mean_life, suffix="")
         leaf_loan_ids = {l.get("loan_id") for l in loans_in_leaf}
         leaf_df = df[df.index.map(lambda i: f"LN-{i+1:04d}" in leaf_loan_ids)]
         tape_plug_leaf = leaf_df["apex2_amort_plug"].mean() if "apex2_amort_plug" in leaf_df.columns and len(leaf_df) > 0 else 0
-        leaf_compare_rows.append((leaf_id, n_loans, leaf_upb, tape_plug_leaf, km_life, mean_life))
+        leaf_compare_rows.append((leaf_id, n_loans, leaf_upb, tape_plug_leaf, km_life_num, km_life_display, mean_life))
 
-    max_life = max(max(r[3], r[4], r[5]) for r in leaf_compare_rows) or 1
+    max_life = max(max(r[3], r[4], r[6]) for r in leaf_compare_rows) or 1
     bar_chart_rows = []
-    for lid, n, upb, plug, km, mean_l in leaf_compare_rows:
+    for lid, n, upb, plug, km_num, km_disp, mean_l in leaf_compare_rows:
         plug_w = plug / max_life * 100
-        km_w = km / max_life * 100
+        km_w = km_num / max_life * 100
         mean_w = mean_l / max_life * 100
         bar_chart_rows.append(f"""
         <div class="life-bar-group">
           <div class="life-bar-label">Leaf {lid} <span class="muted">({n} loans, ${upb:,.0f})</span></div>
           <div class="life-bar-row"><span class="life-bar-tag">APEX2</span><div class="life-bar-track"><div class="life-bar-fill" style="width:{plug_w:.0f}%;background:#f59e0b"></div></div><span class="life-bar-val">{plug:.0f}mo</span></div>
-          <div class="life-bar-row"><span class="life-bar-tag">KM 50%</span><div class="life-bar-track"><div class="life-bar-fill" style="width:{km_w:.0f}%;background:#005C3F"></div></div><span class="life-bar-val">{km}mo</span></div>
+          <div class="life-bar-row"><span class="life-bar-tag">KM 50%</span><div class="life-bar-track"><div class="life-bar-fill" style="width:{km_w:.0f}%;background:#005C3F"></div></div><span class="life-bar-val">{km_disp}mo</span></div>
           <div class="life-bar-row"><span class="life-bar-tag">Mean</span><div class="life-bar-track"><div class="life-bar-fill" style="width:{mean_w:.0f}%;background:#16a34a"></div></div><span class="life-bar-val">{mean_l:.0f}mo</span></div>
         </div>""")
 
@@ -1703,7 +1727,8 @@ def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
     for idx, row in df_sorted.iterrows():
         lid = f"LN-{int(idx + 1):04d}"
         leaf = loan_leaf_map.get(lid, 0)
-        km_life = leaf_km_life.get(leaf, 0)
+        km_life_raw = leaf_km_life.get(leaf)
+        km_life_display = _fmt_life(km_life_raw, suffix="")
         offered = row.get("price_offered", row.get("offered_price", 0))
         apex2_px = row.get("price_apex2", np.nan)
         eng_px = row.get("price_engine", np.nan)
@@ -1748,7 +1773,7 @@ def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
                 <div class="detail-content">
                   {f'<div class="detail-chart">{mini_cf}</div>' if mini_cf else ''}
                   {f'<div class="detail-kickers"><strong>Kickers:</strong> {kicker_info}</div>' if kicker_info else ''}
-                  <div class="detail-meta">Leaf: {leaf} | KM Life: {km_life}mo | Amort Plug: {amort_plug:.0f}mo</div>
+                  <div class="detail-meta">Leaf: {leaf} | KM Life: {km_life_display}mo | Amort Plug: {amort_plug:.0f}mo</div>
                 </div>
               </td>
             </tr>"""
@@ -1837,7 +1862,9 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry, leaf_curves=None)
     for leaf in sorted(tree_structure.get("leaves", []), key=lambda l: l["leaf_id"]):
         lid = leaf["leaf_id"]
         tape_n = leaf_counts.get(lid, 0)
-        km_life = leaf_km_life.get(lid, 0)
+        km_life_raw = leaf_km_life.get(lid)
+        km_life_num = _life_numeric(km_life_raw, leaf.get("mean_time"))
+        km_life_display = _fmt_life(km_life_raw, suffix="")
 
         rules_html = ""
         for i, rule in enumerate(leaf.get("rules", [])):
@@ -1867,7 +1894,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry, leaf_curves=None)
             mini_curve_html = f"""
             <div style="margin-top:8px">
               <div style="font-size:11px;color:#6b7280;margin-bottom:2px;font-weight:600">Survival Curve</div>
-              {_survival_curve_mini_svg(leaf_curves[lid], km_life)}
+              {_survival_curve_mini_svg(leaf_curves[lid], km_life_num)}
             </div>"""
 
         leaf_panels.append(f"""
@@ -1875,7 +1902,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry, leaf_curves=None)
           <div class="leaf-panel-header">
             <span class="leaf-id-tag">Leaf {lid}</span>
             {tape_badge}
-            <span class="leaf-stats">{leaf['samples']:,} training &bull; mean {leaf['mean_time']:.0f}mo &bull; KM {km_life}mo</span>
+            <span class="leaf-stats">{leaf['samples']:,} training &bull; mean {leaf['mean_time']:.0f}mo &bull; KM {km_life_display}mo</span>
             <a href="#tree-diagram" class="back-to-tree" onclick="event.preventDefault();document.getElementById('tree-diagram').scrollIntoView({{behavior:'smooth'}})">&uarr; Back to tree</a>
           </div>
           <div class="leaf-panel-body">
@@ -1890,7 +1917,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry, leaf_curves=None)
                 <tr><td class="stat-label">Payoffs / Censored</td><td class="stat-value">{leaf['n_payoffs']:,} / {leaf['n_censored']:,}</td></tr>
                 <tr><td class="stat-label">Mean Time</td><td class="stat-value">{leaf['mean_time']:.1f} mo</td></tr>
                 <tr><td class="stat-label">Median Time</td><td class="stat-value">{leaf['median_time']:.0f} mo</td></tr>
-                <tr><td class="stat-label">KM 50%-Life</td><td class="stat-value">{km_life} mo</td></tr>
+                <tr><td class="stat-label">KM 50%-Life</td><td class="stat-value">{km_life_display} mo</td></tr>
                 <tr><td class="stat-label">Tape Loans</td><td class="stat-value">{tape_n}</td></tr>
               </table>
               {mini_curve_html}
@@ -2023,7 +2050,8 @@ def _build_tree_list(nested, leaf_counts, leaf_km_life):
         if node["type"] == "leaf":
             lid = node["leaf_id"]
             tape_n = leaf_counts.get(lid, 0)
-            km_life = leaf_km_life.get(lid, 0)
+            km_life_raw = leaf_km_life.get(lid)
+            km_life_display = _fmt_life(km_life_raw, suffix="")
             n_train = node.get("samples", 0)
             tape_cls = " tree-leaf-has-tape" if tape_n > 0 else ""
             tape_badge = (
@@ -2035,7 +2063,7 @@ def _build_tree_list(nested, leaf_counts, leaf_km_life):
                 f'<div class="tree-leaf{tape_cls}" onclick="scrollToLeaf({lid})">'
                 f'{prefix}'
                 f'<span class="leaf-tag">Leaf {lid}</span>'
-                f'<span class="leaf-stats">{n_train:,} training · KM {km_life}mo</span>'
+                f'<span class="leaf-stats">{n_train:,} training · KM {km_life_display}mo</span>'
                 f'{tape_badge}'
                 f'</div>'
             )
@@ -2528,7 +2556,7 @@ def _survival_curve_svg(curves: dict, leaf_km_life: dict, width=540, height=260,
     for i, leaf_id in enumerate(sorted_leaves):
         curve = curves[leaf_id]
         color = palette[i % len(palette)]
-        km_life = leaf_km_life.get(leaf_id, 0)
+        km_life_raw = leaf_km_life.get(leaf_id)
 
         # Build polyline — sample every 2 months for smoother rendering
         pts = []
@@ -2537,16 +2565,17 @@ def _survival_curve_svg(curves: dict, leaf_km_life: dict, width=540, height=260,
         if pts:
             lines.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2" opacity="0.85"/>')
 
-        # Mark 50%-life crossing with a dot
-        if km_life <= max_months:
-            cx = tx(km_life)
+        # Mark 50%-life crossing with a dot (only if it actually crosses)
+        if km_life_raw is not None and km_life_raw <= max_months:
+            cx = tx(km_life_raw)
             cy = ty(0.5)
             lines.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{color}" stroke="white" stroke-width="1.5"/>')
-            lines.append(f'<text x="{cx+6:.1f}" y="{cy-6:.1f}" font-size="9" fill="{color}" font-weight="600">{km_life}mo</text>')
+            lines.append(f'<text x="{cx+6:.1f}" y="{cy-6:.1f}" font-size="9" fill="{color}" font-weight="600">{km_life_raw}mo</text>')
 
+        km_label = f"{km_life_raw}mo" if km_life_raw is not None else "&gt;360"
         legend_items.append(f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">'
                             f'<span style="width:14px;height:3px;background:{color};display:inline-block;border-radius:1px"></span>'
-                            f'<span style="font-size:11px;color:#374151">Leaf {leaf_id} (50%={km_life}mo)</span></span>')
+                            f'<span style="font-size:11px;color:#374151">Leaf {leaf_id} (50%={km_label})</span></span>')
 
     lines.append('</svg>')
     svg = "\n".join(lines)
@@ -2591,8 +2620,8 @@ def _survival_curve_mini_svg(curve: list, km_life: int, width=220, height=100):
     if pts:
         lines.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#005C3F" stroke-width="1.5"/>')
 
-    # 50%-life marker
-    if km_life <= max_months:
+    # 50%-life marker (only if it actually crosses 50%)
+    if km_life is not None and km_life <= max_months:
         cx, cy = tx(km_life), ty(0.5)
         lines.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="#005C3F" stroke="white" stroke-width="1"/>')
 
