@@ -93,6 +93,8 @@ Replace flat 3-scenario system with per-leaf rate-shift overlays.
 - [ ] 3.1.2 Map rate shifts to prepayment response per segment (in/out of the money)
 - [ ] 3.1.3 Add scenario API endpoints with per-leaf stress multipliers
 - [ ] 3.1.4 Frontend: scenario comparison view
+- [ ] 3.1.5 Correlated MC shocks — add a common economic factor so loans experience systemic stress together, not independently. Current model draws independent lognormal shocks per loan per month (sigma=0.15), which understates portfolio tail risk. Implement a single-factor model: `shock = rho * economy_factor + sqrt(1-rho^2) * idiosyncratic`. Calibrate rho from historical delinquency correlation across segments.
+- [ ] 3.1.6 Review scenario severity — current severe (2.5x DEQ, 2x default, 0.65x recovery, 0.4x prepay) is roughly 2008-crisis caliber. May be too harsh for a seasoned 762-FICO / 57%-LTV book. Consider adding a moderate stress tier and benchmarking multipliers against actual FNBA loss history.
 
 ### Epic 3.2: Management Reporting
 
