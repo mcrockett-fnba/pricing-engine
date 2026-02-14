@@ -53,6 +53,30 @@ Verify the tape's loans aren't hitting edge cases or falling outside training da
 
 > **Status**: Report Section 5 has feature distribution vs training range with in-bounds percentages and visual bars. Section 8 has per-leaf training data composition. Remaining: seasoning-specific analysis.
 
+### Epic 1.5: THR Analysis — 12-Month Lookback Repricing
+
+FNBA's THR re-analysis priced the tape $3.8M below Offered ($80.7M → ~$76.9M) by using only the last 12 months of payment behavior instead of full loan history. In the current rate environment (4.5%+ vs 3.2% note rates), recent prepayment speeds are near zero — so longer effective life → lower present value.
+
+**Why our V1 model overstates prepay speed:** Our KM curves are trained on 4.4M loans across all vintages including the 2020-2021 refi wave (Freddie median payoff: 21 months). That fast-prepay era dominates the training data. A 12-month lookback would strip it out.
+
+**Implementation approach — recompute KM curves, keep tree structure:**
+
+- [ ] 1.5.1 **Add `--lookback-months N` flag to `train_segmentation_tree.py`** — Filter training observations: only include loans where `payoff_date >= cutoff` or `last_observation_date >= cutoff` (still performing recently). Censored loans that went silent >N months ago are excluded. The Freddie CSV has `noteDateYear` but may need `last_obs_date` derived from `time + origination_date`. Check if FNBA data has observation dates. If not, filter by `noteDateYear + time >= cutoff_year`.
+- [ ] 1.5.2 **Recompute KM curves only (keep tree fixed)** — The 75-leaf tree structure stays the same (loan routing doesn't change). Only re-run `compute_leaf_survival_curves()` on the filtered subset. This is the fast path: ~30s instead of retraining the full tree (~100s). Save to `models/survival/survival_curves_12mo.parquet` alongside the full-history version.
+- [ ] 1.5.3 **Model versioning in manifest.json** — Add a `curve_variant` field: `"full_history"` (current) vs `"12mo_lookback"`. The `ModelRegistry` loads whichever variant is configured. Structure: `models/survival/survival_curves.parquet` (default, full history) + `models/survival/survival_curves_12mo.parquet`.
+- [ ] 1.5.4 **Add `--curve-variant` flag to `pricing_validation_report.py`** — Run the report with either curve set. The report header should show which variant was used. Default: `full_history`.
+- [ ] 1.5.5 **Generate V2 (12mo lookback) report** — Run with `--curve-variant 12mo_lookback`, save to `reports/v2_12mo_lookback/`. Compare portfolio price delta vs V1. Target: explain the $3.8M gap.
+- [ ] 1.5.6 **Side-by-side comparison** — Add a section to the report (or a standalone script) that overlays V1 vs V2 KM curves for the 5 tape leaves, shows the life delta, and translates to a price delta. This is the CIO deliverable: "here's what the 12-month lookback does and why the price dropped."
+
+**Key questions to resolve:**
+- Does the Freddie CSV have enough date granularity to filter by observation recency? (`noteDateYear` + `time` gives approximate last-observation year, but monthly precision requires `origination_month`.)
+- Should the tree itself be retrained on recent data, or just the curves? (Curves only is faster and more defensible — same segmentation, different prepay assumptions.)
+- What's the right lookback: 12 months? 24? Should we parameterize and show sensitivity?
+
+**Versioned outputs:**
+- `reports/v1_full_history/` — current model (captured 2026-02-14)
+- `reports/v2_12mo_lookback/` — THR-comparable (to be generated)
+
 ---
 
 ## Theme 2: Model Pipeline (Post-Validation)
