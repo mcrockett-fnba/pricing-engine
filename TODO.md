@@ -67,22 +67,17 @@ FNBA's THR re-analysis priced the tape $3.8M below Offered ($80.7M → ~$76.9M) 
 - [x] 1.5.4 **Add `--curve-variant` flag to `pricing_validation_report.py`** — `--curve-variant 12mo` loads variant curves. Report header shows "Curves: 12mo Lookback".
 - [x] 1.5.5 **Generate V2 (12mo lookback) report** — Saved to `reports/v2_12mo_lookback/`.
 - [x] 1.5.6 **Side-by-side comparison** — `curve_comparison_report.py`: per-leaf SVG overlays, life delta table, PV sensitivity estimate. Tape routes to 5 leaves: 42, 43, 44, 69, 75.
-- [ ] 1.5.7 **Use KM as sole prepay model** — Current engine architecture limits KM impact (see finding below).
+- [x] 1.5.7 **KM-only prepay mode in engine** — Added `prepay_model="km_only"` to simulation engine: decomposes KM all-causes hazard into flat CDR (default) + residual (prepay). Available via `SimulationConfig(prepay_model=PrepayModel.km_only)`.
 
-> **Status**: 1.5.1–1.5.5 complete. V2 report generated but PE price delta is only $174K (+0.2%), not $3.8M.
+> **Status**: 1.5.1–1.5.7 complete. The km_only mode is available in the engine for analysis. The report now shows 3 clean price columns: Offered, APEX2, Pricing Engine (MC scaled to APEX2).
 
-**Critical finding — why the delta is small:**
+**Key finding — KM as prepay model:**
 
-The engine uses KM survival curves as an `marginal_default` (all-causes hazard) overlay on top of a separate stub prepayment model. Both reduce the surviving pool independently:
-```
-cumulative_survival *= (1 - marginal_default_from_KM) * (1 - marginal_prepay_from_stub)
-```
-Switching to 12mo lookback flattens the KM curves (hazard → 0), but the stub prepay model continues generating prepay cash flows unchanged. Result: PE price barely moves.
+The engine's `km_only` mode decomposes KM all-causes hazard: `marginal_default = flat CDR`, `marginal_prepay = max(KM_hazard - CDR, 0)`. With 12mo lookback curves (near-zero hazard), prepay drops to zero and loans live full term.
 
-**To replicate the THR $3.8M gap**, the engine must use KM survival as the SOLE exit model:
-- Option A: Derive prepay SMM from KM hazard, replace stub prepay entirely
-- Option B: Set `marginal_default = CDR only` and `marginal_prepay = KM hazard - CDR`
-- Option C: Full competing-risk decomposition (Phase 3)
+However, KM curves are **all-causes exit curves** (blend of default + prepay + turnover + life events). Decomposing via `prepay = KM_hazard - CDR` doesn't extract a clean prepay signal. For seasoned survivors in rising rates, that residual is approximately zero — which understates eventual turnover from home sales, relocations, etc.
+
+**To properly model prepay**, the engine needs cause-specific hazard models (see `backend/docs/competing_risks_prepay_scope.md`). Until then, APEX2 remains the calibration anchor for the Pricing Engine.
 
 **Versioned outputs:**
 - `reports/v1_full_history/` — full-history curves (captured 2026-02-14)
@@ -141,3 +136,9 @@ Replace flat 3-scenario system with per-leaf rate-shift overlays.
 
 - [x] 3.3.1 Render KM survival curves in the report — multi-leaf overlay in Section 2 + mini curves per leaf panel in Section 8.
 - [ ] 3.3.2 Add engine cashflow curves to the tree leaf panels — restore per-leaf projected cashflow or survival line charts in the leaf detail breakouts.
+
+---
+
+## Maybe Someday
+
+- [ ] Replicate PPD_OLD pricing as a report column — the legacy pricing system (SQL procs in `backend/legacy/PPD_OLD/`) predates APEX2. Replicating its formula as a 4th price column would give a historical benchmark. Need to find the actual pricing calculation (the legacy procs are CRUD; the formula likely lived in the app layer or a proc not captured in the repo).
