@@ -1699,8 +1699,8 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
       <tbody>{"".join(freq_rows)}</tbody>
     </table>"""
 
-    # Build tree SVG — recursive layout
-    tree_svg = _build_tree_svg(nested, leaves_meta, leaf_counts, leaf_km_life)
+    # Build tree list — collapsible indented layout
+    tree_html = _build_tree_list(nested, leaf_counts, leaf_km_life)
 
     # Leaf detail panels (hidden, shown on click)
     leaf_panels = []
@@ -1786,6 +1786,25 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
       before tree assignment if the tape contains both.
     </div>"""
 
+    # Note about state group
+    state_leaves = [l for l in tree_structure.get("leaves", [])
+                    if any(r["feature"] == "stateGroup" for r in l.get("rules", []))]
+    state_thresholds = set()
+    for l in state_leaves:
+        for r in l.get("rules", []):
+            if r["feature"] == "stateGroup":
+                state_thresholds.add(r["threshold"])
+
+    state_group_note = f"""
+    <div class="info-callout">
+      <strong>Note on State Group:</strong> US states are pre-binned into 6 groups (0&ndash;5) by median payoff
+      speed from the training data. Group 0 = fastest payoff (AZ, CA, CO, IL, MA, MI, MO, NH, NV, RI, UT, WA, WI),
+      Group 5 = slowest (AL, GU, ND, NM, NY, OK, PA, PR, WV). Appears in {len(state_leaves)} leaves
+      {('at thresholds: ' + ', '.join(f'{t:.1f}' for t in sorted(state_thresholds))) if state_thresholds else '(not used as a split feature)'}.
+      Unknown states default to the median bin (group 3). The grouping captures regional prepayment
+      differences without creating 50 individual features.
+    </div>"""
+
     training_note = """
     <div class="info-callout">
       <strong>Training Data (4.4M loans):</strong> The segmentation tree was trained on 4,425,553 loans:
@@ -1812,166 +1831,93 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
     <div class="table-wrap">{freq_table}</div>
     {credit_note}
     {term_note}
+    {state_group_note}
     {training_note}
 
     <h3 class="subsection">Tree Diagram (Top-Down)</h3>
-    <p class="section-hint">Blue = tape-populated leaves. Gray = no tape loans. Circle size ~ training samples.</p>
-    <div class="tree-diagram-wrap">{tree_svg}</div>
+    <p class="section-hint">Expand/collapse branches to explore. Green-bordered leaves have tape loans. Click a leaf to jump to its detail panel.</p>
+    <div class="tree-list-wrap">{tree_html}</div>
 
     <h3 class="subsection">Leaf Detail Panels</h3>
     <p class="section-hint">Click a leaf above or browse below. Tape-matched leaves highlighted in green.</p>
     {"".join(leaf_panels)}"""
 
 
-def _build_tree_svg(nested, leaves_meta, leaf_counts, leaf_km_life):
-    """Build an SVG tree diagram from the nested tree structure.
+def _build_tree_list(nested, leaf_counts, leaf_km_life):
+    """Build a collapsible indented tree list from the nested tree structure.
 
-    Uses a recursive layout: each subtree is positioned with its leaves
-    spread horizontally.
+    Uses native <details>/<summary> elements for collapse/expand — no JS needed.
+    Top 3 levels expanded by default; deeper levels collapsed.
     """
-    # First, count leaves under each subtree for width allocation
-    def count_leaves(node):
+
+    def _fmt_threshold(feature, thresh):
+        if feature == "interestRate":
+            return f"{thresh:.2f}%"
+        elif feature == "loanSize":
+            return f"${thresh / 1000:.0f}k"
+        elif feature == "origCustAmortMonth":
+            return f"{thresh:.0f}mo"
+        elif feature == "noteDateYear":
+            return f"{thresh:.0f}"
+        elif feature == "ltv":
+            return f"{thresh:.1f}%"
+        elif feature == "creditScore":
+            return f"{thresh:.0f}"
+        else:
+            return f"{thresh:.1f}"
+
+    def _count_samples(node):
+        """Sum training samples under a subtree."""
         if node["type"] == "leaf":
-            return 1
-        return count_leaves(node["left"]) + count_leaves(node["right"])
+            return node.get("samples", 0)
+        return _count_samples(node["left"]) + _count_samples(node["right"])
 
-    total_leaves = count_leaves(nested)
-    width = max(1400, total_leaves * 22)
-    height = 1400
-
-    # Layout parameters
-    y_step = 105
-    pad_t = 30
-    pad_l = 10
-    usable_w = width - 2 * pad_l
-
-    elements = []
-
-    def layout(node, x_start, x_end, depth):
-        cx = (x_start + x_end) / 2
-        cy = pad_t + depth * y_step
-
+    def _render_node(node, depth, branch_label=""):
         if node["type"] == "leaf":
             lid = node["leaf_id"]
             tape_n = leaf_counts.get(lid, 0)
             km_life = leaf_km_life.get(lid, 0)
             n_train = node.get("samples", 0)
-            r = max(6, min(16, math.sqrt(n_train / 1000)))
-
-            if tape_n > 0:
-                # Tape-populated leaf: large, bright, with glow
-                r = max(14, min(24, math.sqrt(tape_n) * 2))
-                fill = "#005C3F"
-                opacity = "1.0"
-                stroke = "#1d4ed8"
-                # Glow ring
-                elements.append(
-                    f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="{r+6:.0f}" fill="none" '
-                    f'stroke="#005C3F" stroke-width="2" opacity="0.3"/>'
-                )
-                elements.append(
-                    f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="{r+12:.0f}" fill="none" '
-                    f'stroke="#005C3F" stroke-width="1" opacity="0.15"/>'
-                )
-            else:
-                fill = "#d1d5db"
-                opacity = "0.4"
-                stroke = "#9ca3af"
-
-            elements.append(
-                f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="{r:.0f}" fill="{fill}" '
-                f'opacity="{opacity}" stroke="{stroke}" stroke-width="{"2" if tape_n else "1"}" '
-                f'class="tree-leaf-circle" data-leaf="{lid}" '
-                f'onclick="scrollToLeaf({lid})"/>'
+            tape_cls = " tree-leaf-has-tape" if tape_n > 0 else ""
+            tape_badge = (
+                f' <span class="badge badge-green">{tape_n} tape loans</span>'
+                if tape_n > 0 else ""
             )
-            # Label
-            if tape_n > 0:
-                # Prominent multi-line label for tape leaves
-                elements.append(
-                    f'<text x="{cx:.0f}" y="{cy + 3:.0f}" text-anchor="middle" '
-                    f'font-size="11" fill="white" font-weight="700">{tape_n}</text>'
-                )
-                elements.append(
-                    f'<text x="{cx:.0f}" y="{cy + r + 13:.0f}" text-anchor="middle" '
-                    f'font-size="10" fill="#1d4ed8" font-weight="700">Leaf {lid}</text>'
-                )
-                elements.append(
-                    f'<text x="{cx:.0f}" y="{cy + r + 24:.0f}" text-anchor="middle" '
-                    f'font-size="9" fill="#6b7280">KM {km_life}mo</text>'
-                )
-            else:
-                elements.append(
-                    f'<text x="{cx:.0f}" y="{cy + r + 11:.0f}" text-anchor="middle" '
-                    f'font-size="8" fill="#9ca3af">{lid}</text>'
-                )
-            return cx, cy
+            prefix = f'<span class="branch-label">{branch_label}</span> ' if branch_label else ""
+            return (
+                f'<div class="tree-leaf{tape_cls}" onclick="scrollToLeaf({lid})">'
+                f'{prefix}'
+                f'<span class="leaf-tag">Leaf {lid}</span>'
+                f'<span class="leaf-stats">{n_train:,} training · KM {km_life}mo</span>'
+                f'{tape_badge}'
+                f'</div>'
+            )
 
         # Internal node
-        n_left = count_leaves(node["left"])
-        n_right = count_leaves(node["right"])
-        total = n_left + n_right
-        split_x = x_start + (n_left / total) * (x_end - x_start)
-
-        lcx, lcy = layout(node["left"], x_start, split_x, depth + 1)
-        rcx, rcy = layout(node["right"], split_x, x_end, depth + 1)
-
-        # Draw edges
-        elements.append(
-            f'<line x1="{cx:.0f}" y1="{cy+8:.0f}" x2="{lcx:.0f}" y2="{lcy-8:.0f}" '
-            f'stroke="#d1d5db" stroke-width="1"/>'
-        )
-        elements.append(
-            f'<line x1="{cx:.0f}" y1="{cy+8:.0f}" x2="{rcx:.0f}" y2="{rcy-8:.0f}" '
-            f'stroke="#d1d5db" stroke-width="1"/>'
-        )
-
-        # Node box
         feat = FEATURE_NAMES.get(node["feature"], node["feature"])
-        thresh = node["threshold"]
-        if node["feature"] == "interestRate":
-            thresh_s = f"{thresh:.2f}%"
-        elif node["feature"] == "loanSize":
-            thresh_s = f"${thresh/1000:.0f}k"
-        elif node["feature"] == "origCustAmortMonth":
-            thresh_s = f"{thresh:.0f}mo"
-        elif node["feature"] == "noteDateYear":
-            thresh_s = f"{thresh:.0f}"
-        elif node["feature"] == "ltv":
-            thresh_s = f"{thresh:.1f}%"
-        elif node["feature"] == "creditScore":
-            thresh_s = f"{thresh:.0f}"
-        else:
-            thresh_s = f"{thresh:.1f}"
+        thresh_s = _fmt_threshold(node["feature"], node["threshold"])
+        n_samples = _count_samples(node)
+        open_attr = " open" if depth <= 2 else ""
+        prefix = f'<span class="branch-label">{branch_label}</span> ' if branch_label else ""
 
-        # Show labels for first 6 levels (we have vertical room)
-        if depth <= 6:
-            label_text = f"{feat} &le; {thresh_s}"
-            box_w = max(len(label_text) * 5.5, 60)
-            elements.append(
-                f'<rect x="{cx - box_w/2:.0f}" y="{cy - 10:.0f}" width="{box_w:.0f}" height="20" '
-                f'rx="4" fill="white" stroke="#d1d5db" stroke-width="1"/>'
-            )
-            elements.append(
-                f'<text x="{cx:.0f}" y="{cy + 3:.0f}" text-anchor="middle" '
-                f'font-size="9" fill="#374151">{label_text}</text>'
-            )
-        else:
-            elements.append(
-                f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="4" fill="white" stroke="#d1d5db"/>'
-            )
+        left_html = _render_node(node["left"], depth + 1, f"≤ {thresh_s}")
+        right_html = _render_node(node["right"], depth + 1, f"> {thresh_s}")
 
-        return cx, cy
+        return (
+            f'<details{open_attr}>'
+            f'<summary class="tree-node">'
+            f'{prefix}'
+            f'<span class="node-split">{feat} ≤ {thresh_s}</span>'
+            f'<span class="node-samples">{n_samples:,} loans</span>'
+            f'</summary>'
+            f'<div class="tree-children">'
+            f'{left_html}'
+            f'{right_html}'
+            f'</div>'
+            f'</details>'
+        )
 
-    layout(nested, pad_l, pad_l + usable_w, 0)
-
-    svg = (
-        f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" '
-        f'style="max-width:100%;height:auto">\n'
-        f'<rect width="{width}" height="{height}" fill="#fafafa" rx="6"/>\n'
-        + "\n".join(elements)
-        + "\n</svg>"
-    )
-    return svg
+    return _render_node(nested, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2643,18 +2589,62 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
   .tab-content {{ display: none; }}
   .tab-content.active {{ display: block; }}
 
-  /* Tree diagram */
-  .tree-diagram-wrap {{
-    overflow-x: auto;
+  /* Tree list (collapsible) */
+  .tree-list-wrap {{
     background: white;
     border: 1px solid var(--gray-200);
     border-radius: 10px;
-    padding: 16px;
+    padding: 16px 12px;
     margin-bottom: 20px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    max-height: 700px;
+    overflow-y: auto;
+    font-size: 13px;
+    font-family: "SF Mono", "Fira Code", monospace;
   }}
-  .tree-leaf-circle {{ cursor: pointer; }}
-  .tree-leaf-circle:hover {{ stroke-width: 3; }}
+  .tree-list-wrap details {{ margin-left: 20px; }}
+  .tree-list-wrap > details {{ margin-left: 0; }}
+  .tree-list-wrap summary {{
+    cursor: pointer;
+    padding: 3px 6px;
+    border-radius: 4px;
+    list-style: none;
+  }}
+  .tree-list-wrap summary::-webkit-details-marker {{ display: none; }}
+  .tree-list-wrap summary::before {{
+    content: "▶ ";
+    font-size: 10px;
+    color: var(--gray-400);
+    transition: transform 0.15s;
+    display: inline-block;
+  }}
+  .tree-list-wrap details[open] > summary::before {{
+    transform: rotate(90deg);
+  }}
+  .tree-list-wrap summary:hover {{ background: #f3f4f6; }}
+  .node-split {{ font-weight: 600; color: var(--gray-800); }}
+  .node-samples {{ color: var(--gray-400); font-size: 11px; margin-left: 8px; }}
+  .branch-label {{ color: var(--gray-400); font-size: 11px; }}
+  .tree-leaf {{
+    margin-left: 20px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }}
+  .tree-leaf:hover {{ background: #f0fdf4; }}
+  .tree-leaf-has-tape {{
+    border-left: 3px solid var(--green);
+    background: #f8fdf9;
+  }}
+  .leaf-tag {{
+    font-weight: 700;
+    color: var(--blue);
+    margin-right: 8px;
+  }}
+  .tree-leaf .leaf-stats {{
+    color: var(--gray-400);
+    font-size: 11px;
+    margin-right: 8px;
+  }}
 
   .leaf-panel {{
     background: white;
@@ -2734,6 +2724,8 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     .tab-nav {{ display: none; }}
     .tab-content {{ display: block !important; }}
     .leaf-panel {{ break-inside: avoid; }}
+    .tree-list-wrap {{ max-height: none; overflow: visible; }}
+    .tree-list-wrap details {{ break-inside: avoid; }}
   }}
 </style>
 </head>
@@ -2842,6 +2834,24 @@ function scrollToLeaf(leafId) {{
     setTimeout(() => panel.style.boxShadow = '', 2000);
   }}
 }}
+
+// Print: expand all tree details, then restore after printing
+(function() {{
+  let _savedState = [];
+  window.addEventListener('beforeprint', () => {{
+    _savedState = [];
+    document.querySelectorAll('.tree-list-wrap details').forEach(d => {{
+      _savedState.push({{ el: d, wasOpen: d.hasAttribute('open') }});
+      d.setAttribute('open', '');
+    }});
+  }});
+  window.addEventListener('afterprint', () => {{
+    _savedState.forEach(({{ el, wasOpen }}) => {{
+      if (!wasOpen) el.removeAttribute('open');
+    }});
+    _savedState = [];
+  }});
+}})();
 </script>
 </body>
 </html>"""
