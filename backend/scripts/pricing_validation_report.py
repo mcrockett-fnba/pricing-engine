@@ -824,6 +824,22 @@ def stage_sensitivity(df, pkg, results, loan_leaf_map):
             "vs_offered": total_npv / offered_total if offered_total > 0 else 0,
         }
 
+    # --- Directional correctness: baseline >= mild >= severe per loan ---
+    n_loans = len(df)
+    base_ge_mild = (df["pv_baseline"] >= df["pv_mild"]).sum()
+    mild_ge_severe = (df["pv_mild"] >= df["pv_severe"]).sum()
+    base_ge_severe = (df["pv_baseline"] >= df["pv_severe"]).sum()
+    portfolio_base = df["pv_baseline"].sum()
+    portfolio_mild = df["pv_mild"].sum()
+    portfolio_severe = df["pv_severe"].sum()
+    scenario_stress["directional"] = {
+        "n_loans": n_loans,
+        "base_ge_mild": base_ge_mild,
+        "mild_ge_severe": mild_ge_severe,
+        "base_ge_severe": base_ge_severe,
+        "portfolio_monotonic": portfolio_base >= portfolio_mild >= portfolio_severe,
+    }
+
     logger.info("  Stage 6 done (%.1fs)", time.time() - t0)
     return stub_impacts, feature_bounds, scenario_stress
 
@@ -890,31 +906,9 @@ def stage_assemble_html(
     n_stub = sum(1 for s in stub_impacts if s["impact_label"] == "Stub")
     n_total = len(stub_impacts)
 
-    # Verdict: based on price alignment across models
-    # Primary metric: how close are the 4 price estimates?
-    price_spread_pct = abs(engine_vs_offered - 1.0) * 100
-    if apex2_vs_offered >= 0.95 and price_spread_pct <= 10 and avg_in_bounds >= 90:
-        verdict = "PRICING VALIDATED"
-        verdict_color = "#16a34a"
-    elif apex2_vs_offered >= 0.90 and price_spread_pct <= 20 and avg_in_bounds >= 75:
-        verdict = "CAUTIOUSLY SUPPORTED"
-        verdict_color = "#ca8a04"
-    elif avg_in_bounds >= 75:
-        stub_note = f" ({n_stub}/{n_total} sub-models pending)" if n_stub > 0 else ""
-        if price_spread_pct <= 30:
-            verdict = f"PARTIALLY VALIDATED{stub_note}"
-            verdict_color = "#005C3F"
-        else:
-            verdict = f"PRICE DIVERGENCE {price_spread_pct:.0f}%{stub_note}"
-            verdict_color = "#ca8a04"
-    else:
-        verdict = "REQUIRES REVIEW"
-        verdict_color = "#ef4444"
-
     # --- Build HTML sections ---
     section1 = _build_executive_summary(
         df, pkg, total_upb, total_offered, avg_cents, wt_avg, now,
-        verdict, verdict_color,
         price_totals=pt, apex2_vs_offered=apex2_vs_offered,
         engine_vs_offered=engine_vs_offered, life_divergence=life_divergence,
         avg_in_bounds=avg_in_bounds, n_stub=n_stub, n_total=n_total,
@@ -936,7 +930,9 @@ def stage_assemble_html(
     if mc_results and portfolio_mc_pvs:
         section8 = _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress)
 
-    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8)
+    section9 = _build_assumptions_tab(df, wt_avg)
+
+    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8, section9)
     return page
 
 
@@ -967,7 +963,7 @@ def _traffic_light_svg(label: str, value: float, thresholds: tuple, unit: str = 
 
 
 def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
-                              wt_avg, now, verdict, verdict_color,
+                              wt_avg, now,
                               price_totals=None, apex2_vs_offered=0,
                               engine_vs_offered=0, life_divergence=0,
                               avg_in_bounds=100, n_stub=0, n_total=5,
@@ -1036,6 +1032,7 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     target_yield = wt_avg(df["roe_target_yield"]) if "roe_target_yield" in df.columns else 0
     cof = wt_avg(df["cost_of_funds"]) if "cost_of_funds" in df.columns else 0
     capital = wt_avg(df["capital_ratio"]) if "capital_ratio" in df.columns else 0
+    tax = wt_avg(df["tax_rate"]) if "tax_rate" in df.columns else 0
 
     metrics = f"""
     <div class="metrics-grid">
@@ -1065,16 +1062,74 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     <div class="traffic-lights" style="flex-direction:row;flex-wrap:wrap;gap:20px">
       {_traffic_light_svg("APEX2 vs Offered", apex2_vs_offered * 100, (95, 85), "%")}
       {_traffic_light_svg("Engine vs Offered", engine_vs_offered * 100, (90, 70), "%")}
-      {_traffic_light_svg("Life Divergence", life_divergence, (20, 40), "%", invert=True)}
+      {_traffic_light_svg("Prepay Life Gap (Tape vs KM)", life_divergence, (20, 40), "%", invert=True)}
       {_traffic_light_svg("Features In Bounds", avg_in_bounds, (90, 75), "%")}
     </div>
     <div style="font-size:12px;color:#6b7280;margin-top:8px">
       Sub-models: {n_total - n_stub}/{n_total} real | Life: APEX2 {tape_plug:.0f}mo vs KM {avg_km_life:.0f}mo vs Mean {avg_mean_life:.0f}mo
     </div>"""
 
-    verdict_banner = f"""
-    <div class="verdict-banner" style="background:{verdict_color}20; border-color:{verdict_color}; color:{verdict_color};">
-      Pricing appears <strong>{verdict}</strong>
+    # --- ROE summary row ---
+    roe_off_val = pt.get("roe_offered")
+    roe_a2_val = pt.get("roe_apex2")
+    roe_eng_val = pt.get("roe_engine")
+    roe_mc_val = pt.get("roe_mc")
+    tape_roe_target = roe_offered  # from tape's "ROE As Offered"
+
+    def _roe_chip(label, val, target):
+        if val is None:
+            return f'<div style="display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:6px;background:#f3f4f6"><span style="font-weight:600;font-size:12px">{label}</span><span style="font-size:13px;color:#6b7280">n/a</span></div>'
+        color = "#16a34a" if val >= target else ("#ca8a04" if val >= target * 0.9 else "#ef4444")
+        bg = "#f0fdf4" if val >= target else ("#fefce8" if val >= target * 0.9 else "#fef2f2")
+        return f'<div style="display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:6px;background:{bg}"><span style="font-weight:600;font-size:12px">{label}</span><span style="font-size:14px;font-weight:700;color:{color}">{val:.1%}</span></div>'
+
+    roe_banner = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:center">
+      <span style="font-size:12px;color:#6b7280;font-weight:600">Implied ROE:</span>
+      {_roe_chip("Offered", roe_off_val, tape_roe_target)}
+      {_roe_chip("APEX2", roe_a2_val, tape_roe_target)}
+      {_roe_chip("PPD_OLD", roe_eng_val, tape_roe_target)}
+      {_roe_chip("PE", roe_mc_val, tape_roe_target)}
+      <span style="font-size:11px;color:#9ca3af">(target {tape_roe_target:.1%})</span>
+    </div>"""
+
+    # Neutral price-spread summary — no judgment, just facts
+    spread_pct = abs(engine_vs_offered - 1.0) * 100
+    direction = "below" if engine_vs_offered < 1.0 else "above"
+    spread_banner = f"""
+    <div class="info-callout" style="margin-top:12px">
+      <strong>Price spread:</strong> PPD_OLD is {spread_pct:.1f}% {direction} Offered
+      &bull; APEX2 is {abs(apex2_vs_offered - 1.0) * 100:.1f}% {"above" if apex2_vs_offered >= 1.0 else "below"} Offered
+      &bull; Prepay life gap: tape {tape_plug:.0f}mo vs KM {avg_km_life:.0f}mo ({life_divergence:.0f}%)
+      &bull; {n_total - n_stub}/{n_total} sub-models real
+    </div>"""
+
+    methodology_note = f"""
+    <div class="info-callout" style="margin-top:16px">
+      <strong>How to read the four prices:</strong> All four columns are present values discounted
+      at the tape&rsquo;s <em>ROE target yield</em> (pool avg {target_yield:.2%}), making them directly
+      comparable. The differences come from methodology, not from different return targets.
+      <table style="margin:10px 0 6px;border-collapse:collapse;font-size:12px;width:100%">
+        <tr style="border-bottom:1px solid #ddd">
+          <td style="padding:4px 8px;font-weight:600;width:120px">Offered</td>
+          <td style="padding:4px 8px">The actual bid price from the tape (market price).</td>
+        </tr>
+        <tr style="border-bottom:1px solid #ddd">
+          <td style="padding:4px 8px;font-weight:600">APEX2</td>
+          <td style="padding:4px 8px">PV of APEX2 amortization schedule with <em>no</em> credit adjustment. Pure prepayment-driven price.</td>
+        </tr>
+        <tr style="border-bottom:1px solid #ddd">
+          <td style="padding:4px 8px;font-weight:600">PPD_OLD</td>
+          <td style="padding:4px 8px">Same APEX2 schedule plus a 0.15% annual CDR credit haircut (50% recovery, 25 bps servicing). The gap vs APEX2 = the credit cost.</td>
+        </tr>
+        <tr>
+          <td style="padding:4px 8px;font-weight:600">Pricing Engine</td>
+          <td style="padding:4px 8px">Monte Carlo mean (200 paths/loan, &sigma;=0.15 stochastic shocks) scaled from the engine&rsquo;s 8% CoC to the target yield.</td>
+        </tr>
+      </table>
+      <strong>Key assumptions:</strong> CDR 0.15% &bull; Recovery 50% &bull; Servicing 25 bps (cash-flow calc)
+      &bull; CoF {cof:.2%} &bull; Capital {capital:.2%} &bull; Tax {tax:.2%}
+      &bull; CTA $850 default. Values sourced from the tape where available; fallbacks shown in Section&nbsp;3.
     </div>"""
 
     return f"""
@@ -1082,7 +1137,9 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     {cards}
     {price_bars}
     {metrics}
-    {verdict_banner}"""
+    {roe_banner}
+    {spread_banner}
+    {methodology_note}"""
 
 
 def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_leaf_map,
@@ -1175,6 +1232,30 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
       <span style="color:#16a34a">&#9632;</span> KM Mean Life (expected lifetime from survival curve)
     </div>"""
 
+    provenance = """
+    <div class="info-callout" style="margin-top:12px">
+      <strong>Where do the KM survival curves come from?</strong><br>
+      The Kaplan-Meier (KM) curves are derived from a 75-leaf segmentation tree trained on
+      <strong>4.4 million actual loan outcomes</strong>: 41,897 FNBA internal loans plus 4,383,656
+      Freddie Mac conforming loans (a 10% random sample of Freddie's ~44M public dataset).
+      <em>All</em> loans are used — including censored observations (loans still performing) —
+      so the estimates are not biased by only looking at loans that have already paid off.
+      <ol style="margin:8px 0 4px 16px;font-size:12px;line-height:1.6">
+        <li><strong>Tree routing:</strong> Each tape loan is routed through the decision tree based on
+            9 features (vintage year, rate, credit, LTV, loan size, state group, DTI, ITIN, orig term)
+            to land in one of 75 leaves.</li>
+        <li><strong>KM estimation:</strong> Within each leaf, a non-parametric Kaplan-Meier survival
+            curve tracks the fraction of training loans still performing at each month (1–360).
+            Curves are EMA-smoothed and tail-extrapolated.</li>
+        <li><strong>Life metrics:</strong> &ldquo;50%-Life&rdquo; = month when half the leaf&rsquo;s loans
+            had paid off (median). &ldquo;Mean Life&rdquo; = area under the survival curve (expected lifetime).</li>
+      </ol>
+      The APEX2 &ldquo;Amort Plug&rdquo; is FNBA&rsquo;s production effective-life assumption, derived from
+      4-dimensional prepayment-speed lookup tables (credit, rate delta, LTV, loan size).
+      Large divergence between APEX2 and KM signals that the historical payoff pattern for these loans
+      differs from APEX2&rsquo;s assumption.
+    </div>"""
+
     note = """
     <div class="info-callout">
       <strong>Reading this chart:</strong> Three independent life estimates are compared:<br>
@@ -1188,6 +1269,7 @@ def _build_effective_life(df, leaf_loans, leaf_km_life, leaf_mean_life, loan_lea
     return f"""
     <h2 class="section-title">2. Effective Life Comparison</h2>
     {summary}
+    {provenance}
     {note}
     <h3 class="subsection">Per-Leaf Comparison</h3>
     <div class="table-wrap">{leaf_table}</div>
@@ -1556,6 +1638,37 @@ def _build_sensitivity(stub_impacts, feature_bounds, scenario_stress, total_upb)
       <tbody>{"".join(stress_rows)}</tbody>
     </table>"""
 
+    # --- Directional correctness flags ---
+    dc = scenario_stress.get("directional", {})
+    if dc:
+        n_loans = dc["n_loans"]
+        port_ok = dc["portfolio_monotonic"]
+        bm = dc["base_ge_mild"]
+        ms = dc["mild_ge_severe"]
+        bs = dc["base_ge_severe"]
+        port_badge = '<span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-weight:700;font-size:12px">PASS</span>' if port_ok else '<span style="background:#ef4444;color:white;padding:2px 8px;border-radius:4px;font-weight:700;font-size:12px">FAIL</span>'
+        bm_pct = bm / n_loans * 100 if n_loans > 0 else 0
+        ms_pct = ms / n_loans * 100 if n_loans > 0 else 0
+        bm_color = "#16a34a" if bm_pct >= 90 else ("#ca8a04" if bm_pct >= 75 else "#ef4444")
+        ms_color = "#16a34a" if ms_pct >= 90 else ("#ca8a04" if ms_pct >= 75 else "#ef4444")
+
+        directional_box = f"""
+    <div style="margin-top:16px;padding:12px 16px;border-radius:8px;background:{'#f0fdf4' if port_ok else '#fef2f2'};border:1px solid {'#bbf7d0' if port_ok else '#fecaca'}">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <strong style="font-size:13px">Directional Correctness</strong> {port_badge}
+      </div>
+      <div style="font-size:12px;color:#374151;line-height:1.6">
+        <strong>Portfolio-level:</strong> baseline &ge; mild &ge; severe &rarr; {'Yes' if port_ok else 'No — scenarios not monotonically ordered'}<br>
+        <strong>Per-loan (base &ge; mild):</strong> <span style="color:{bm_color};font-weight:600">{bm} of {n_loans}</span> ({bm_pct:.0f}%) &mdash; {n_loans - bm} violations<br>
+        <strong>Per-loan (mild &ge; severe):</strong> <span style="color:{ms_color};font-weight:600">{ms} of {n_loans}</span> ({ms_pct:.0f}%) &mdash; {n_loans - ms} violations
+      </div>
+      <div style="font-size:11px;color:#6b7280;margin-top:6px">
+        Per-loan violations are expected when stochastic shocks dominate small balance loans. Portfolio-level monotonicity is the key check.
+      </div>
+    </div>"""
+    else:
+        directional_box = ""
+
     return f"""
     <h2 class="section-title">5. Sensitivity &amp; Risk</h2>
     <h3 class="subsection">Model Status</h3>
@@ -1563,7 +1676,8 @@ def _build_sensitivity(stub_impacts, feature_bounds, scenario_stress, total_upb)
     <h3 class="subsection">Feature Distribution vs Training Range</h3>
     {feat_section}
     <h3 class="subsection">Scenario Stress</h3>
-    {stress_table}"""
+    {stress_table}
+    {directional_box}"""
 
 
 def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
@@ -1660,7 +1774,7 @@ def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
 
 
 # ---------------------------------------------------------------------------
-# Section 7: Segmentation Tree Diagram
+# Section 8: Segmentation Tree Diagram
 # ---------------------------------------------------------------------------
 def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
     """Build an interactive top-down tree diagram with clickable leaves."""
@@ -1737,6 +1851,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
             <span class="leaf-id-tag">Leaf {lid}</span>
             {tape_badge}
             <span class="leaf-stats">{leaf['samples']:,} training &bull; mean {leaf['mean_time']:.0f}mo &bull; KM {km_life}mo</span>
+            <a href="#tree-diagram" class="back-to-tree" onclick="event.preventDefault();document.getElementById('tree-diagram').scrollIntoView({{behavior:'smooth'}})">&uarr; Back to tree</a>
           </div>
           <div class="leaf-panel-body">
             <div class="tree-rules-col">
@@ -1818,7 +1933,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
     </div>"""
 
     return f"""
-    <h2 class="section-title">7. Segmentation Tree Diagram</h2>
+    <h2 class="section-title">8. Segmentation Tree Diagram</h2>
     <p class="section-hint">
       The segmentation tree assigns each loan to a leaf based on 9 features.
       KM = Kaplan-Meier survival estimate &mdash; a non-parametric method that tracks the fraction
@@ -1836,7 +1951,7 @@ def _build_tree_diagram(loan_leaf_map, leaf_km_life, registry):
 
     <h3 class="subsection">Tree Diagram (Top-Down)</h3>
     <p class="section-hint">Expand/collapse branches to explore. Green-bordered leaves have tape loans. Click a leaf to jump to its detail panel.</p>
-    <div class="tree-list-wrap">{tree_html}</div>
+    <div class="tree-list-wrap" id="tree-diagram">{tree_html}</div>
 
     <h3 class="subsection">Leaf Detail Panels</h3>
     <p class="section-hint">Click a leaf above or browse below. Tape-matched leaves highlighted in green.</p>
@@ -1872,6 +1987,12 @@ def _build_tree_list(nested, leaf_counts, leaf_km_life):
             return node.get("samples", 0)
         return _count_samples(node["left"]) + _count_samples(node["right"])
 
+    def _has_tape_leaf(node):
+        """Return True if any leaf under this subtree has tape loans."""
+        if node["type"] == "leaf":
+            return leaf_counts.get(node["leaf_id"], 0) > 0
+        return _has_tape_leaf(node["left"]) or _has_tape_leaf(node["right"])
+
     def _render_node(node, depth, branch_label=""):
         if node["type"] == "leaf":
             lid = node["leaf_id"]
@@ -1893,11 +2014,11 @@ def _build_tree_list(nested, leaf_counts, leaf_km_life):
                 f'</div>'
             )
 
-        # Internal node
+        # Internal node — expand if on path to a tape leaf, or top 2 levels
         feat = FEATURE_NAMES.get(node["feature"], node["feature"])
         thresh_s = _fmt_threshold(node["feature"], node["threshold"])
         n_samples = _count_samples(node)
-        open_attr = " open" if depth <= 2 else ""
+        open_attr = " open" if _has_tape_leaf(node) or depth <= 2 else ""
         prefix = f'<span class="branch-label">{branch_label}</span> ' if branch_label else ""
 
         left_html = _render_node(node["left"], depth + 1, f"≤ {thresh_s}")
@@ -1921,10 +2042,10 @@ def _build_tree_list(nested, leaf_counts, leaf_km_life):
 
 
 # ---------------------------------------------------------------------------
-# Section 8: Monte Carlo Validation
+# Section 7: Monte Carlo Validation
 # ---------------------------------------------------------------------------
 def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress):
-    """Build Section 8: Monte Carlo Validation.
+    """Build Section 7: Monte Carlo Validation.
 
     Shows MC results in both NPV space (8% CoC) and price space (target yield).
     The price-space results connect directly to the 4-price comparison in Section 4.
@@ -1987,6 +2108,55 @@ def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress
       </tbody>
     </table>"""
 
+    # --- MC Noise Diagnostic ---
+    mc_pvs_arr = np.array(portfolio_mc_pvs) if portfolio_mc_pvs else np.array([])
+    if len(mc_pvs_arr) > 1:
+        port_cv = np.std(mc_pvs_arr) / np.mean(mc_pvs_arr) * 100 if np.mean(mc_pvs_arr) != 0 else 0
+        cv_color = "#16a34a" if port_cv <= 2 else ("#ca8a04" if port_cv <= 5 else "#ef4444")
+        cv_bg = "#f0fdf4" if port_cv <= 2 else ("#fefce8" if port_cv <= 5 else "#fef2f2")
+
+        # % loans where MC 90% band contains Offered price
+        if "price_mc_p5" in df.columns and "price_mc_p95" in df.columns and "price_offered" in df.columns:
+            mc_valid_diag = df[df["price_mc_p5"].notna() & df["price_mc_p95"].notna()].copy()
+            n_crossing = ((mc_valid_diag["price_mc_p5"] <= mc_valid_diag["price_offered"]) &
+                          (mc_valid_diag["price_offered"] <= mc_valid_diag["price_mc_p95"])).sum()
+            n_mc_loans = len(mc_valid_diag)
+            cross_pct = n_crossing / n_mc_loans * 100 if n_mc_loans > 0 else 0
+        else:
+            n_crossing = n_mc_loans = 0
+            cross_pct = 0
+
+        # Median per-loan spread
+        med_spread = df["mc_spread"].median() if "mc_spread" in df.columns and df["mc_spread"].notna().any() else 0
+
+        noise_diagnostic = f"""
+    <h3 class="subsection">MC Noise Diagnostic</h3>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px">
+      <div style="flex:1;min-width:160px;padding:10px 14px;border-radius:8px;background:{cv_bg};border:1px solid #e5e7eb">
+        <div style="font-size:22px;font-weight:700;color:{cv_color}">{port_cv:.2f}%</div>
+        <div style="font-size:12px;color:#374151;font-weight:600">Portfolio CV</div>
+        <div style="font-size:11px;color:#6b7280">std/mean &times; 100 &bull; {'Low noise' if port_cv <= 2 else ('Moderate noise' if port_cv <= 5 else 'High noise')}</div>
+      </div>
+      <div style="flex:1;min-width:160px;padding:10px 14px;border-radius:8px;background:#f9fafb;border:1px solid #e5e7eb">
+        <div style="font-size:22px;font-weight:700;color:#374151">{cross_pct:.0f}%</div>
+        <div style="font-size:12px;color:#374151;font-weight:600">Loans w/ Offered in MC Band</div>
+        <div style="font-size:11px;color:#6b7280">{n_crossing} of {n_mc_loans} loans &bull; 90% confidence interval contains offered price</div>
+      </div>
+      <div style="flex:1;min-width:160px;padding:10px 14px;border-radius:8px;background:#f9fafb;border:1px solid #e5e7eb">
+        <div style="font-size:22px;font-weight:700;color:#374151">{med_spread:.1f}%</div>
+        <div style="font-size:12px;color:#374151;font-weight:600">Median Per-Loan Spread</div>
+        <div style="font-size:11px;color:#6b7280">(p95 &minus; p5) / mean &times; 100</div>
+      </div>
+    </div>
+    <div class="info-callout" style="font-size:12px">
+      <strong>Interpretation:</strong> Portfolio CV &le;2% means the MC mean is well-converged and additional
+      simulations would not materially change the result. If the &ldquo;Offered in MC Band&rdquo; percentage is
+      high, the engine cannot confidently distinguish its valuation from the tape&rsquo;s offered price &mdash;
+      which is expected when models are well-calibrated.
+    </div>"""
+    else:
+        noise_diagnostic = ""
+
     # Distribution histogram (NPV space — still informative for shape)
     histogram = _histogram_svg(portfolio_mc_pvs, total_offered, total_det_npv) if portfolio_mc_pvs else ""
 
@@ -2039,11 +2209,12 @@ def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress
     </div>"""
 
     return f"""
-    <h2 class="section-title">8. Pricing Engine Validation</h2>
+    <h2 class="section-title">7. Pricing Engine Validation</h2>
     {note}
     {cards}
     <h3 class="subsection">Price Comparison: PPD_OLD vs Pricing Engine vs Offered</h3>
     {comparison}
+    {noise_diagnostic}
     <h3 class="subsection">NPV Distribution ({n_sims} simulations, 8% CoC)</h3>
     <div class="chart-container">{histogram}</div>
     <h3 class="subsection">Pricing Engine vs Offered Price (per loan)</h3>
@@ -2277,9 +2448,140 @@ def _mini_cashflow_svg(cash_flows, width=300, height=80):
 
 
 # ---------------------------------------------------------------------------
+# Section 9: Assumptions & Review Checklist
+# ---------------------------------------------------------------------------
+def _build_assumptions_tab(df, wt_avg):
+    """Build the assumptions & review-checklist tab content."""
+    w = df["balance"]
+
+    def _tape_val(col, alt_col=None):
+        """Return (weighted-avg value, True if from tape) or (None, False)."""
+        for c in [col, alt_col] if alt_col else [col]:
+            if c and c in df.columns and df[c].notna().any():
+                wts = w.loc[df[c].dropna().index]
+                val = (df[c].dropna() * wts).sum() / wts.sum() if wts.sum() > 0 else None
+                if val is not None and val != 0:
+                    return val, True
+        return None, False
+
+    rows = []
+
+    def _add(label, tape_col, alt_col, fallback, fmt, note=""):
+        val, from_tape = _tape_val(tape_col, alt_col)
+        display_val = val if val is not None else fallback
+        source = "Tape" if from_tape else "Fallback"
+        src_cls = "src-tape" if from_tape else "src-fallback"
+        flag = "" if from_tape else ' <span class="assumption-flag">⚠ verify</span>'
+        rows.append(
+            f'<tr>'
+            f'<td>{label}</td>'
+            f'<td class="num">{fmt.format(display_val)}</td>'
+            f'<td class="num">{fmt.format(fallback)}</td>'
+            f'<td><span class="{src_cls}">{source}</span>{flag}</td>'
+            f'<td class="note-col">{note}</td>'
+            f'</tr>'
+        )
+
+    _add("ROE Target Yield", "roe_target_yield", "ROE Target Yield", 0.07,
+         "{:.2%}", "Discount rate for all four price columns.")
+    _add("Cost of Funds", "cost_of_funds", "Cost of Funds", 0.0427,
+         "{:.2%}", "Blended warehouse/repo rate. Changes with market rates.")
+    _add("Capital Ratio", "capital_ratio", "Capital", 0.0886,
+         "{:.2%}", "Regulatory or economic capital allocation.")
+    _add("Tax Rate", "tax_rate", "Tax Rate", 0.0047,
+         "{:.2%}", "Effective tax drag on yield.")
+    _add("Servicing Cost (ROE calc)", "servicing_cost_tape", "Servicing Cost", 0.0049,
+         "{:.2%}", "Used in implied-ROE formula. Note: CF calc uses 25 bps (see below).")
+    _add("Cost to Acquire", "cost_to_acquire", None, 850,
+         "${:,.0f}", "Per-loan due-diligence, legal, boarding cost.")
+
+    table_rows = "".join(rows)
+
+    # Hardcoded assumptions that don't come from the tape
+    hardcoded = """
+    <h3 class="subsection">Hardcoded Assumptions (not sourced from tape)</h3>
+    <table class="data-table">
+      <thead><tr><th>Parameter</th><th>Value</th><th>Used In</th><th>Notes / Questions for Management</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Annual CDR</td><td class="num">0.15%</td><td>PPD_OLD price</td>
+          <td class="note-col">Industry range for seasoned non-QM is 0.2&ndash;2.0%. Current value is <em>below</em> industry floor.
+              Should this vary by credit tier or pool vintage?</td>
+        </tr>
+        <tr>
+          <td>Recovery Rate</td><td class="num">50%</td><td>PPD_OLD price</td>
+          <td class="note-col">Typical for agency collateral. Is 50% appropriate for non-QM? What does historical recovery data show?</td>
+        </tr>
+        <tr>
+          <td>Servicing Cost (CF calc)</td><td class="num">25 bps</td><td>PPD_OLD cash flows</td>
+          <td class="note-col"><span class="assumption-flag">&ne; ROE calc</span> The cash-flow PV calc uses 25 bps but the
+              implied-ROE formula uses the tape&rsquo;s servicing cost (fallback 49 bps). These should match. Confirm actual servicing cost.</td>
+        </tr>
+        <tr>
+          <td>Engine Cost of Capital</td><td class="num">8.0%</td><td>Pricing Engine MC</td>
+          <td class="note-col">Fixed base discount rate for Monte Carlo engine. MC results are then re-scaled to the target yield.
+              Is 8% the right CoC for base NPV?</td>
+        </tr>
+        <tr>
+          <td>Stochastic Volatility (&sigma;)</td><td class="num">15%</td><td>Pricing Engine MC</td>
+          <td class="note-col">Lognormal shock applied to monthly default, prepay, recovery, and delinquency rates.
+              Has this been calibrated to observed month-over-month variation?</td>
+        </tr>
+        <tr>
+          <td>MC Simulations</td><td class="num">200 / loan</td><td>Pricing Engine MC</td>
+          <td class="note-col">Overridable via <code>--mc-sims</code>. 200 is a speed/accuracy trade-off; 500+ gives smoother tails.</td>
+        </tr>
+        <tr>
+          <td>Default Prepay Multiplier</td><td class="num">2.3&times;</td><td>PPD_OLD, APEX2</td>
+          <td class="note-col">Fallback when tape doesn&rsquo;t provide <code>apex2_prepay</code> / <code>avg_4dim</code>. Confirm this matches current APEX2 assumptions.</td>
+        </tr>
+        <tr>
+          <td>Default Amort Plug</td><td class="num">97 mo</td><td>APEX2 life</td>
+          <td class="note-col">Fallback when tape doesn&rsquo;t provide <code>apex2_amort_plug</code> / <code>nper_life</code>.</td>
+        </tr>
+      </tbody>
+    </table>"""
+
+    checklist = """
+    <h3 class="subsection">Review Checklist</h3>
+    <p class="section-hint">Questions to validate with management or wholesalers before relying on these prices.</p>
+    <div class="checklist">
+      <label class="check-item"><input type="checkbox"> <strong>CDR:</strong> Is 0.15% the right base-case default rate for this pool? Should it vary by credit band?</label>
+      <label class="check-item"><input type="checkbox"> <strong>Recovery:</strong> Is 50% net recovery realistic for non-QM? Check historical liquidation data.</label>
+      <label class="check-item"><input type="checkbox"> <strong>Servicing cost mismatch:</strong> CF calc uses 25 bps but ROE formula uses tape value (fallback 49 bps). Which is correct?</label>
+      <label class="check-item"><input type="checkbox"> <strong>Cost of funds:</strong> Is the tape CoF current? Warehouse rates change frequently.</label>
+      <label class="check-item"><input type="checkbox"> <strong>Capital ratio:</strong> Regulatory vs economic capital &mdash; which does the business use for bid decisions?</label>
+      <label class="check-item"><input type="checkbox"> <strong>ROE target yield:</strong> Confirm the tape populates this per-loan. If missing, everything falls back to 7%.</label>
+      <label class="check-item"><input type="checkbox"> <strong>Cost to acquire:</strong> Is $850/loan still current? Varies by seller and diligence scope.</label>
+      <label class="check-item"><input type="checkbox"> <strong>MC volatility (&sigma;=15%):</strong> Has this been calibrated to actual month-over-month rate variation?</label>
+      <label class="check-item"><input type="checkbox"> <strong>Systemic correlation:</strong> MC shocks are independent across loans. Portfolio tail risk may be understated for economy-wide events.</label>
+    </div>"""
+
+    return f"""
+    <h2 class="section-title">9. Assumptions &amp; Review Checklist</h2>
+    <p class="section-hint">
+      All four prices (Offered, APEX2, PPD_OLD, Pricing Engine) are present values discounted at the
+      tape&rsquo;s ROE target yield, making them directly comparable. Differences come from methodology
+      (how prepayment and credit losses are modeled), not from different return targets.
+    </p>
+
+    <h3 class="subsection">Tape-Sourced Parameters</h3>
+    <p class="section-hint">Green = from tape. Orange = using hardcoded fallback &mdash; verify these with management.</p>
+    <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr><th>Parameter</th><th>Pool Avg</th><th>Fallback</th><th>Source</th><th>Notes</th></tr></thead>
+      <tbody>{table_rows}</tbody>
+    </table>
+    </div>
+
+    {hardcoded}
+    {checklist}"""
+
+
+# ---------------------------------------------------------------------------
 # Page assembly
 # ---------------------------------------------------------------------------
-def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8=""):
+def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8="", section9=""):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2383,14 +2685,6 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
   .tl-value {{ font-size: 18px; font-weight: 700; }}
   .tl-label {{ font-size: 12px; color: var(--gray-600); }}
 
-  .verdict-banner {{
-    border: 2px solid;
-    border-radius: 10px;
-    padding: 16px 24px;
-    font-size: 18px;
-    text-align: center;
-    margin-bottom: 20px;
-  }}
 
   .table-wrap {{ overflow-x: auto; margin-bottom: 20px; }}
   .data-table {{
@@ -2665,6 +2959,19 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     flex-wrap: wrap;
     margin-bottom: 12px;
   }}
+  .back-to-tree {{
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--blue);
+    text-decoration: none;
+    cursor: pointer;
+    padding: 2px 8px;
+    border: 1px solid var(--gray-200);
+    border-radius: 4px;
+  }}
+  .back-to-tree:hover {{
+    background: var(--gray-50, #f9fafb);
+  }}
   .leaf-id-tag {{
     font-size: 16px;
     font-weight: 700;
@@ -2714,6 +3021,56 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     color: #003D2A;
   }}
 
+  /* Assumptions tab */
+  .src-tape {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: #dcfce7;
+    color: #166534;
+  }}
+  .src-fallback {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: #fff7ed;
+    color: #9a3412;
+  }}
+  .assumption-flag {{
+    font-size: 11px;
+    color: #dc2626;
+    font-weight: 600;
+    margin-left: 4px;
+  }}
+  .note-col {{
+    font-size: 12px;
+    color: var(--gray-600);
+    max-width: 340px;
+  }}
+  .checklist {{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+  }}
+  .check-item {{
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+    line-height: 1.5;
+    cursor: pointer;
+  }}
+  .check-item input[type="checkbox"] {{
+    accent-color: var(--blue);
+    margin-top: 3px;
+    flex-shrink: 0;
+  }}
+
   @media print {{
     body {{ background: white; }}
     .page {{ max-width: none; padding: 0; }}
@@ -2742,6 +3099,7 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     <button class="tab-btn active" onclick="switchTab('main')">Pricing Validation</button>
     <button class="tab-btn" onclick="switchTab('mc')">Pricing Engine</button>
     <button class="tab-btn" onclick="switchTab('tree')">Segmentation Tree</button>
+    <button class="tab-btn" onclick="switchTab('assumptions')">Assumptions</button>
   </div>
 
   <div id="tab-main" class="tab-content active">
@@ -2759,6 +3117,10 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
 
   <div id="tab-tree" class="tab-content">
     {section7}
+  </div>
+
+  <div id="tab-assumptions" class="tab-content">
+    {section9}
   </div>
 
   <div class="footer">
@@ -2870,6 +3232,8 @@ def main():
                         help="Skip Monte Carlo simulation for faster generation")
     parser.add_argument("--mc-sims", type=int, default=200,
                         help="Number of MC simulations per loan (default: 200)")
+    parser.add_argument("--no-csv", action="store_true",
+                        help="Skip CSV export")
     args = parser.parse_args()
 
     run_mc = args.mc and not args.no_mc
@@ -2924,6 +3288,38 @@ def main():
     out_path.write_text(html, encoding="utf-8")
 
     logger.info("Wrote %s (%d KB)", out_path, len(html) // 1024)
+
+    # --- CSV export ---
+    if not args.no_csv:
+        csv_df = pd.DataFrame()
+        csv_df["loan_id"] = [f"LN-{i+1:04d}" for i in df.index]
+        csv_df["balance"] = df["balance"].values
+        csv_df["rate"] = df["rate"].values
+        csv_df["credit"] = df["credit"].values
+        csv_df["ltv"] = df.get("ltv", pd.Series(dtype=float)).values if "ltv" in df.columns else np.nan
+        csv_df["seasoning"] = df["seasoning"].values
+        csv_df["rem_term"] = df["rem_term"].values
+        csv_df["leaf_id"] = [loan_leaf_map.get(f"LN-{i+1:04d}", "") for i in df.index]
+        for col in ["price_offered", "price_apex2", "price_engine", "price_mc"]:
+            if col in df.columns:
+                csv_df[col] = df[col].values
+        total_upb_csv = df["balance"].sum()
+        for col in ["price_offered", "price_apex2", "price_engine", "price_mc"]:
+            if col in df.columns:
+                csv_df[col.replace("price_", "cents_")] = df[col].values / df["balance"].values * 100
+        for col in ["pv_baseline", "pv_mild", "pv_severe", "model_npv", "implied_yield"]:
+            if col in df.columns:
+                csv_df[col] = df[col].values
+        for col in ["price_mc_p5", "price_mc_p95", "mc_spread"]:
+            if col in df.columns:
+                csv_df[col] = df[col].values
+        if "km_life" in df.columns:
+            csv_df["km_life"] = df["km_life"].values
+
+        csv_path = out_path.with_suffix(".csv")
+        csv_df.to_csv(csv_path, index=False)
+        logger.info("Wrote %s (%d rows, %d cols)", csv_path, len(csv_df), len(csv_df.columns))
+
     logger.info("Total time: %.1fs", time.time() - t_start)
 
 
