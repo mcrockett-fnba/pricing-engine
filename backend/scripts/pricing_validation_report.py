@@ -4,7 +4,7 @@
 Compares FNBA's offered pricing against the pricing engine's models
 (survival curves, segmentation tree, APEX2 tables, stub DEQ/default/recovery/prepay).
 
-Generates a management-ready go/no-go report as a single self-contained HTML file.
+Generates a self-contained HTML report for internal review and iteration.
 
 Usage:
     cd backend && python scripts/pricing_validation_report.py
@@ -377,6 +377,92 @@ def _implied_yield(cash_flows, offered_price: float) -> float:
     return (lo + hi) / 2
 
 
+def _price_loan_at_yield(loan: Loan, bucket_id: int, annual_yield: float,
+                         annual_cdr: float = 0.0015,
+                         annual_turnover_floor: float = 0.05) -> float:
+    """Price a loan at target yield using KM survival curves directly.
+
+    Bypasses the engine's cashflow projector to avoid a balance-reduction
+    bug (engine subtracts survival-weighted defaults/prepays from balance
+    alongside full principal, causing balance to burn down too fast for
+    high-hazard curves).
+
+    Uses standard amortization for balance (per-loan, unaffected by
+    population exits) and KM survival for probability weighting.
+
+    Assumptions:
+      - annual_cdr: flat conditional default rate (default 0.15%)
+      - annual_turnover_floor: minimum annual prepay rate representing
+        irreducible life-event turnover (home sales, relocation, divorce,
+        death, etc.) regardless of rate environment. KM-derived prepay
+        can exceed this floor but never falls below it. Default 5% CPR.
+        To be replaced by a cause-specific turnover model in Phase 2.
+    """
+    from app.ml.curve_provider import get_survival_curve as _get_surv
+
+    curve = _get_surv(bucket_id, n_months=360)
+    r = annual_yield / 12.0
+    monthly_cdr = 1.0 - (1.0 - annual_cdr) ** (1.0 / 12.0)
+    monthly_turnover = 1.0 - (1.0 - annual_turnover_floor) ** (1.0 / 12.0)
+    monthly_servicing = 0.0025 / 12.0
+    lgd = 0.25  # 75% recovery → 25% loss severity
+
+    balance = loan.unpaid_balance
+    remaining = loan.remaining_term
+    if remaining <= 0 or balance <= 0 or annual_yield <= 0:
+        return 0.0
+
+    # Standard PMT
+    mr = loan.interest_rate / 12.0
+    if mr > 0:
+        pmt = balance * mr / (1.0 - (1.0 + mr) ** -remaining)
+    else:
+        pmt = balance / remaining
+
+    total_pv = 0.0
+    prev_surv = 1.0
+
+    for month in range(1, remaining + 1):
+        if balance <= 0:
+            break
+
+        # KM survival at loan_age + month
+        age_idx = loan.loan_age + month - 1  # 0-indexed into curve
+        if age_idx < len(curve):
+            km_surv = curve[age_idx]
+        else:
+            km_surv = curve[-1] if curve else 1.0
+        km_surv = min(km_surv, prev_surv)  # enforce monotone
+
+        # KM hazard → decompose into default + prepay
+        km_hazard = 1.0 - km_surv / prev_surv if prev_surv > 0 else 0.0
+        h_default = monthly_cdr
+        h_prepay = max(km_hazard - monthly_cdr, 0.0)
+        # Turnover floor: life-event prepay never drops below baseline
+        h_prepay = max(h_prepay, monthly_turnover)
+
+        # New survival after this month's exits
+        new_surv = prev_surv * (1.0 - h_default) * (1.0 - h_prepay)
+
+        # Cashflows (population-weighted)
+        scheduled = min(pmt, balance * (1.0 + mr))
+        expected_payment = scheduled * new_surv
+        expected_prepay = h_prepay * balance * prev_surv
+        expected_loss = h_default * lgd * balance * prev_surv
+        servicing = balance * monthly_servicing * new_surv
+
+        net_cf = expected_payment + expected_prepay - expected_loss - servicing
+        total_pv += net_cf / (1.0 + r) ** month
+
+        # Amortize balance normally (per-loan, no default/prepay reduction)
+        interest = balance * mr
+        principal = scheduled - interest
+        balance = max(balance - principal, 0.0)
+        prev_surv = new_surv
+
+    return total_pv
+
+
 def _compute_apex2_price(pandi, prepay_mult, amort_plug, target_yield, cta):
     """Replicate APEX2 price = PV of accelerated payments at target yield.
 
@@ -478,14 +564,19 @@ def stage_monte_carlo(df, pkg, n_sims=200, prepay_model="stub", annual_cdr=0.001
 
 
 # ===================================================================
-# STAGE 5c: Price Comparison (4 estimates at tape's ROE target yield)
+# STAGE 5c: Price Comparison (3 estimates at tape's ROE target yield)
 # ===================================================================
 def stage_price_comparison(df, results, pkg, mc_results=None):
     """Compute 3 price estimates per loan, all at the tape's ROE target yield.
 
     1. Offered — Final Price with ITV cap from tape
     2. APEX2 Replicated — PV(target_yield, amort_plug, P&I×mult - CTA/plug)
-    3. Pricing Engine — MC distribution scaled to the APEX2 price.
+    3. Pricing Engine — KM survival curve priced at target yield, with MC
+       spread preserving the stochastic CV around that anchor.
+
+    The PE column reflects whichever KM curves are loaded (full history
+    vs 12mo lookback). Uses _price_loan_at_yield() which computes PV
+    directly from the KM curve with correct per-loan amortization.
 
     Returns updated df with price columns and portfolio-level summary dict.
     """
@@ -532,7 +623,6 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
 
         if pd.isna(pandi) or pandi <= 0:
             price_apex2.append(np.nan)
-            apex2_px = np.nan
         else:
             if pd.isna(prepay_mult):
                 prepay_mult = 2.3
@@ -541,15 +631,23 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
             apex2_px = _compute_apex2_price(pandi, prepay_mult, amort_plug, target_yield, cta)
             price_apex2.append(apex2_px)
 
-        # Pricing Engine: scale MC distribution to the APEX2 price.
-        # MC was run at 8% CoC. We preserve the relative spread (CV)
-        # but center on the APEX2 price at target yield.
+        # Pricing Engine: price directly from KM survival curves at target yield.
+        # Uses correct per-loan amortization (balance unaffected by population
+        # exits), so the PE price properly reflects the loaded KM curves.
         r = results.get(lid)
         det_npv_8pct = r.expected_pv if r else 0
-        if mc_results and lid in mc_results and not pd.isna(apex2_px) and apex2_px > 0:
+        loan = loan_lookup.get(lid)
+        engine_px = 0.0
+        if r and loan:
+            engine_px = _price_loan_at_yield(loan, r.bucket_id, target_yield)
+
+        # MC scaling: preserve stochastic spread (CV) around engine price.
+        # MC was run at 8% CoC; we scale each draw so the mean maps to
+        # engine_px at target yield, keeping the relative dispersion.
+        if mc_results and lid in mc_results and engine_px > 0:
             mc_r = mc_results[lid]
             if mc_r.pv_distribution and det_npv_8pct > 0:
-                scale = apex2_px / det_npv_8pct
+                scale = engine_px / det_npv_8pct
                 mc_pvs_scaled = [pv * scale for pv in mc_r.pv_distribution]
                 price_mc.append(np.mean(mc_pvs_scaled))
                 mc_pvs_sorted = sorted(mc_pvs_scaled)
@@ -558,9 +656,14 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
                 price_mc_p5.append(mc_pvs_sorted[p5_idx])
                 price_mc_p95.append(mc_pvs_sorted[p95_idx])
             else:
-                price_mc.append(apex2_px)
+                price_mc.append(engine_px)
                 price_mc_p5.append(np.nan)
                 price_mc_p95.append(np.nan)
+        elif engine_px > 0:
+            # No MC — use deterministic engine price at target yield
+            price_mc.append(engine_px)
+            price_mc_p5.append(np.nan)
+            price_mc_p95.append(np.nan)
         else:
             price_mc.append(np.nan)
             price_mc_p5.append(np.nan)
@@ -1011,7 +1114,8 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
         </tr>
       </table>
       <strong>Key assumptions:</strong> CoF {cof:.2%} &bull; Capital {capital:.2%} &bull; Tax {tax:.2%}
-      &bull; CTA $850 default. Values sourced from the tape where available; fallbacks shown in Section&nbsp;3.
+      &bull; CTA $850 &bull; CDR 0.15% &bull; Turnover floor 5% CPR.
+      Values sourced from the tape where available; fallbacks shown in Section&nbsp;9.
     </div>"""
 
     return f"""
@@ -2495,9 +2599,27 @@ def _build_assumptions_tab(df, wt_avg):
               implied-ROE formula uses the tape&rsquo;s servicing cost (fallback 49 bps). These should match. Confirm actual servicing cost.</td>
         </tr>
         <tr>
+          <td>CDR (Default Rate)</td><td class="num">0.15% annual</td><td>PE price</td>
+          <td class="note-col">Flat conditional default rate applied to all loans. Extracted from the KM all-causes hazard
+              (default = CDR, prepay = residual). Should vary by credit band in Phase 2.</td>
+        </tr>
+        <tr>
+          <td>Turnover Floor</td><td class="num">5% CPR</td><td>PE price</td>
+          <td class="note-col"><span class="assumption-flag">Assumed</span> Minimum annual prepay rate representing irreducible
+              life-event turnover (home sales, relocation, divorce, death). KM-derived prepay can exceed this but
+              never falls below it. Prevents the engine from pricing loans as zero-prepay when KM curves are flat.
+              To be replaced by a cause-specific turnover model (see <code>competing_risks_prepay_scope.md</code>).</td>
+        </tr>
+        <tr>
+          <td>Recovery Rate</td><td class="num">75%</td><td>PE price</td>
+          <td class="note-col">Net recovery on defaulted balance (25% loss severity). FNBA&rsquo;s actual recovery
+              on this population is near 100% given 57% avg LTV and strong collateral values.
+              75% is a conservative haircut; to be calibrated to FNBA liquidation history.</td>
+        </tr>
+        <tr>
           <td>Engine Cost of Capital</td><td class="num">8.0%</td><td>Pricing Engine MC</td>
-          <td class="note-col">Fixed base discount rate for Monte Carlo engine. MC results are then re-scaled to the target yield
-              using APEX2 as the calibration anchor.</td>
+          <td class="note-col">Fixed base discount rate for Monte Carlo engine. MC results are then re-scaled to the PE price
+              at target yield, preserving the stochastic spread (CV).</td>
         </tr>
         <tr>
           <td>Stochastic Volatility (&sigma;)</td><td class="num">15%</td><td>Pricing Engine MC</td>
@@ -2524,7 +2646,8 @@ def _build_assumptions_tab(df, wt_avg):
     <p class="section-hint">Questions to validate with management or wholesalers before relying on these prices.</p>
     <div class="checklist">
       <label class="check-item"><input type="checkbox"> <strong>CDR:</strong> Is 0.15% the right base-case default rate for this pool? Should it vary by credit band?</label>
-      <label class="check-item"><input type="checkbox"> <strong>Recovery:</strong> Is 50% net recovery realistic for non-QM? Check historical liquidation data.</label>
+      <label class="check-item"><input type="checkbox"> <strong>Turnover floor:</strong> Is 5% CPR a reasonable baseline for life-event turnover on seasoned non-QM? Compare to FNBA historical payoff rates excluding refi.</label>
+      <label class="check-item"><input type="checkbox"> <strong>Recovery:</strong> 75% is conservative given 57% avg LTV. Calibrate to FNBA actual liquidation recoveries.</label>
       <label class="check-item"><input type="checkbox"> <strong>Servicing cost mismatch:</strong> CF calc uses 25 bps but ROE formula uses tape value (fallback 49 bps). Which is correct?</label>
       <label class="check-item"><input type="checkbox"> <strong>Cost of funds:</strong> Is the tape CoF current? Warehouse rates change frequently.</label>
       <label class="check-item"><input type="checkbox"> <strong>Capital ratio:</strong> Regulatory vs economic capital &mdash; which does the business use for bid decisions?</label>
@@ -3243,7 +3366,7 @@ def main():
         logger.info("Using curve variant: %s (%d curves loaded)",
                      args.curve_variant, len(registry.survival_curves))
 
-    prepay_model_label = "Stub"
+    prepay_model_label = "KM Decomposed (CDR + Residual Prepay)"
 
     # Stage 3: Bucket assignment
     loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life, leaf_curves = stage_bucket_assignment(pkg)
@@ -3251,15 +3374,18 @@ def main():
     # Stage 4: APEX2 analysis
     df, scenarios_9 = stage_apex2_analysis(df)
 
-    # Stage 5: Cashflow valuation
-    df, results = stage_cashflow_valuation(df, pkg, loan_leaf_map)
+    # Stage 5: Cashflow valuation — use km_only so KM exits are classified
+    # as prepayments (returning par) rather than defaults (credit loss).
+    df, results = stage_cashflow_valuation(
+        df, pkg, loan_leaf_map, prepay_model="km_only",
+    )
 
     # Stage 5b: Monte Carlo (if enabled)
     mc_results = None
     portfolio_mc_pvs = None
     if run_mc:
         df, mc_results, portfolio_mc_pvs = stage_monte_carlo(
-            df, pkg, n_sims=args.mc_sims,
+            df, pkg, n_sims=args.mc_sims, prepay_model="km_only",
         )
     else:
         logger.info("Skipping Monte Carlo (use --mc to enable)")
@@ -3282,9 +3408,18 @@ def main():
         prepay_model_label=prepay_model_label,
     )
 
-    REPORTS_DIR.mkdir(exist_ok=True)
-    out_name = args.out or "pricing_validation.html"
-    out_path = REPORTS_DIR / out_name
+    # Default output: versioned subdirectory based on curve variant
+    if args.out:
+        out_dir = REPORTS_DIR
+        out_name = args.out
+    elif args.curve_variant:
+        out_dir = REPORTS_DIR / f"v2_{args.curve_variant}_lookback"
+        out_name = "pricing_validation.html"
+    else:
+        out_dir = REPORTS_DIR / "v1_full_history"
+        out_name = "pricing_validation.html"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / out_name
     out_path.write_text(html, encoding="utf-8")
 
     logger.info("Wrote %s (%d KB)", out_path, len(html) // 1024)
