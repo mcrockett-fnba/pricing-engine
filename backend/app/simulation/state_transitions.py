@@ -33,35 +33,48 @@ def get_monthly_transitions(
     remaining_term: int,
     scenario: ScenarioParams,
     loan_rate: float = 0.065,
+    prepay_model: str = "stub",
+    annual_cdr: float = 0.0015,
 ) -> list[MonthlyTransition]:
     """Build per-month transition vector for a loan.
 
     Uses the survival curve to derive marginal default hazard:
         h(t) = 1 - S(t)/S(t-1)
     Then applies scenario stress multipliers to DEQ, default, and recovery.
+
+    When prepay_model="km_only", the KM hazard is decomposed:
+        marginal_default = flat monthly CDR (from annual_cdr)
+        marginal_prepay  = max(KM_hazard - monthly_cdr, 0)
+    This avoids double-counting prepayment (KM already includes it).
     """
     curve = get_survival_curve(bucket_id, remaining_term)
     base_loss_severity = get_loss_severity(bucket_id)
     base_recovery = get_recovery_rate(bucket_id)
+
+    # Pre-compute monthly CDR for km_only mode
+    monthly_cdr = 1.0 - (1.0 - annual_cdr) ** (1.0 / 12.0)
 
     transitions: list[MonthlyTransition] = []
     for m in range(remaining_term):
         month_num = m + 1
         current_age = loan_age + m
 
-        # Survival and marginal default from curve
+        # KM hazard from survival curve
         s_curr = curve[m]
         s_prev = curve[m - 1] if m > 0 else 1.0
-        # NOTE: KM survival captures all exits (default + prepay + payoff).
-        # marginal_default here is the all-causes hazard from KM, not pure default.
-        # This is an interim approach; Phase 3 will implement proper competing risks.
-        marginal_default = max(1.0 - s_curr / s_prev, 0.0) if s_prev > 0 else 0.0
+        km_hazard = max(1.0 - s_curr / s_prev, 0.0) if s_prev > 0 else 0.0
 
         # DEQ rate from stub model
         deq = get_deq_rate(bucket_id, current_age)
 
-        # Prepayment hazard from stub model
-        base_prepay = get_prepay_hazard(bucket_id, current_age, loan_rate)
+        if prepay_model == "km_only":
+            # KM decomposition: flat CDR for default, residual for prepay
+            marginal_default = monthly_cdr
+            base_prepay = max(km_hazard - monthly_cdr, 0.0)
+        else:
+            # Current behavior: KM as all-causes default + stub prepay
+            marginal_default = km_hazard
+            base_prepay = get_prepay_hazard(bucket_id, current_age, loan_rate)
 
         # Apply scenario stress multipliers
         stressed_default = min(marginal_default * scenario.default_multiplier, 1.0)

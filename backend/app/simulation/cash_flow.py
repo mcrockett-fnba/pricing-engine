@@ -32,6 +32,8 @@ def project_cash_flows(
     bucket_id: int,
     scenario: ScenarioParams,
     stochastic_shocks: list[dict[str, float]] | None = None,
+    prepay_model: str = "stub",
+    annual_cdr: float = 0.0015,
 ) -> list[MonthlyCashFlow]:
     """Project monthly cash flows for a single loan under a scenario.
 
@@ -41,6 +43,8 @@ def project_cash_flows(
         scenario: Scenario parameters with stress multipliers.
         stochastic_shocks: Optional per-month multiplier dicts with keys
             'deq', 'default', 'recovery' for Monte Carlo perturbation.
+        prepay_model: "stub" (current) or "km_only" (KM decomposition).
+        annual_cdr: Annual CDR for km_only mode (default 0.15%).
 
     Returns:
         List of MonthlyCashFlow for each month of remaining term.
@@ -48,6 +52,8 @@ def project_cash_flows(
     transitions = get_monthly_transitions(
         bucket_id, loan.loan_age, loan.remaining_term, scenario,
         loan_rate=loan.interest_rate,
+        prepay_model=prepay_model,
+        annual_cdr=annual_cdr,
     )
 
     monthly_discount = get_monthly_discount_rate(scenario.coc_scenario)

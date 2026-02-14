@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from app.models.loan import Loan
 from app.models.package import Package
-from app.models.simulation import SimulationConfig, ValuationTrack
+from app.models.simulation import PrepayModel, SimulationConfig, ValuationTrack
 from app.models.valuation import (
     LoanValuationResult,
     ModelProvenance,
@@ -23,13 +23,20 @@ from app.simulation.engine import simulate_loan as run_track_b_loan
 _TRACK_B_VERSION = "1.0.0"
 
 
-def _get_track_b_provenance() -> ModelProvenance:
+def _get_track_b_provenance(config: SimulationConfig | None = None) -> ModelProvenance:
     registry = ModelRegistry.get()
+    if config and config.prepay_model == PrepayModel.km_only:
+        cdr_pct = config.annual_cdr * 100
+        prepay_source = f"KM_only (CDR={cdr_pct:.2f}%)"
+        credit_model = f"flat_CDR_{cdr_pct:.2f}pct"
+    else:
+        prepay_source = "KM_survival_hazard"
+        credit_model = "KM_state_transitions"
     return ModelProvenance(
         track="B",
         track_b_version=_TRACK_B_VERSION,
-        prepayment_source="KM_survival_hazard",
-        credit_model="KM_state_transitions",
+        prepayment_source=prepay_source,
+        credit_model=credit_model,
         discount_method="cost_of_capital",
         discount_rate_annual=0.08,
     )
@@ -44,13 +51,13 @@ def valuate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
 
     if track == ValuationTrack.B:
         result = run_track_b_loan(loan, config)
-        result.provenance = _get_track_b_provenance()
+        result.provenance = _get_track_b_provenance(config)
         return result
 
     # track == both: run both, calibrate, return Track B with calibration
     track_a = valuate_loan_track_a(loan, config)
     track_b = run_track_b_loan(loan, config)
-    track_b.provenance = _get_track_b_provenance()
+    track_b.provenance = _get_track_b_provenance(config)
     track_b.calibration = calibrate_loan(track_a, track_b)
     return track_b
 
@@ -64,13 +71,13 @@ def valuate_package(package: Package, config: SimulationConfig) -> PackageValuat
 
     if track == ValuationTrack.B:
         result = run_track_b_valuation(package, config)
-        result.provenance = _get_track_b_provenance()
+        result.provenance = _get_track_b_provenance(config)
         return result
 
     # track == both: run both, calibrate, return Track B with calibration
     track_a = valuate_package_track_a(package, config)
     track_b = run_track_b_valuation(package, config)
-    track_b.provenance = _get_track_b_provenance()
+    track_b.provenance = _get_track_b_provenance(config)
 
     cal = calibrate_package(track_a, track_b)
     track_b.calibration_summary = cal

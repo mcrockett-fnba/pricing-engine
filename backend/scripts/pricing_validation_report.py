@@ -59,7 +59,7 @@ from app.simulation.cash_flow import project_cash_flows
 from app.simulation.scenarios import get_scenario_params
 from app.simulation.state_transitions import get_monthly_transitions
 from app.ml.stub_prepayment import get_prepay_hazard
-from app.models.simulation import SimulationConfig
+from app.models.simulation import PrepayModel, SimulationConfig
 from app.models.loan import Loan
 
 # Feature display names (shared across sections)
@@ -291,7 +291,7 @@ def stage_apex2_analysis(df):
 # ===================================================================
 # STAGE 5: Deterministic Cashflow Valuation
 # ===================================================================
-def stage_cashflow_valuation(df, pkg, loan_leaf_map):
+def stage_cashflow_valuation(df, pkg, loan_leaf_map, prepay_model="stub", annual_cdr=0.0015):
     logger.info("Stage 5: Deterministic cashflow valuation")
     t0 = time.time()
 
@@ -299,6 +299,8 @@ def stage_cashflow_valuation(df, pkg, loan_leaf_map):
         n_simulations=0,
         scenarios=["baseline", "mild_recession", "severe_recession"],
         include_stochastic=False,
+        prepay_model=PrepayModel(prepay_model),
+        annual_cdr=annual_cdr,
     )
 
     results = {}  # loan_id -> LoanValuationResult
@@ -484,10 +486,116 @@ def _calibrated_cf_pv(loan, bucket_id, scenario, prepay_mult, annual_yield,
     return total_pv
 
 
+def _km_only_cf_pv(loan, bucket_id, annual_yield, annual_cdr=0.0015,
+                    recovery_rate=0.50):
+    """PV of cashflows using KM-decomposed prepay model at tape's target yield.
+
+    Uses the same logic as the simulation engine's km_only mode:
+        marginal_default = flat monthly CDR
+        marginal_prepay  = max(KM_hazard - CDR_monthly, 0)
+    but discounts at the tape's ROE target yield instead of the engine's 8% CoC.
+    """
+    from app.ml.curve_provider import get_survival_curve
+
+    r_yield = annual_yield / 12.0
+    r_loan = loan.interest_rate / 12.0
+    balance = loan.unpaid_balance
+    n_months = loan.remaining_term
+
+    # Scheduled P&I
+    if n_months > 0 and r_loan > 0:
+        pmt = balance * r_loan / (1.0 - (1.0 + r_loan) ** -n_months)
+    else:
+        pmt = balance / max(n_months, 1)
+
+    # Monthly CDR and KM survival curve
+    monthly_cdr = 1.0 - (1.0 - annual_cdr) ** (1.0 / 12.0)
+    net_lgd = 1.0 - recovery_rate
+    servicing_monthly = 0.0025 / 12.0
+    curve = get_survival_curve(bucket_id, n_months)
+
+    cumul_surv = 1.0
+    total_pv = 0.0
+
+    for m in range(n_months):
+        if balance <= 0.01:
+            break
+        month_num = m + 1
+
+        # KM hazard → decompose into default + prepay
+        s_curr = curve[m]
+        s_prev = curve[m - 1] if m > 0 else 1.0
+        km_hazard = max(1.0 - s_curr / s_prev, 0.0) if s_prev > 0 else 0.0
+        marginal_default = monthly_cdr
+        marginal_prepay = max(km_hazard - monthly_cdr, 0.0)
+
+        surv_entering = cumul_surv
+        cumul_surv *= (1.0 - marginal_default) * (1.0 - marginal_prepay)
+
+        # Scheduled payment capped at balance + interest
+        interest = balance * r_loan
+        payment = min(pmt, balance + interest)
+        expected_pmt = payment * cumul_surv
+
+        # Credit loss
+        net_credit_loss = marginal_default * net_lgd * balance * surv_entering
+
+        # Prepay at par
+        expected_prepay = marginal_prepay * balance * surv_entering
+
+        # Servicing
+        serv = balance * servicing_monthly * cumul_surv
+
+        net_cf = expected_pmt + expected_prepay - net_credit_loss - serv
+
+        # Discount at target yield
+        df = 1.0 / (1.0 + r_yield) ** month_num
+        total_pv += net_cf * df
+
+        # Amortize
+        principal = min(payment - interest, balance)
+        default_red = marginal_default * balance * surv_entering
+        prepay_red = marginal_prepay * balance * surv_entering
+        balance = max(balance - principal - default_red - prepay_red, 0.0)
+
+    return total_pv
+
+
+def _rate_adj_multiplier(dim_credit, dim_rate_delta, dim_ltv, dim_loan_size):
+    """Compute rate-environment-adjusted APEX2 multiplier.
+
+    For loans with negative rate delta (note rate below market), the refi
+    component of prepay is inactive. Credit and loan_size are refi enablers
+    (higher credit = easier refi, larger loan = more refi savings); they
+    don't drive housing turnover. We drop them and average only the two
+    structural dimensions: rate_delta (rate environment) and LTV (equity/
+    mobility).
+
+    Detection: dim_rate_delta < 1.84 (the neutral-band value) indicates
+    negative rate delta. The APEX2 rate_delta lookup returns 1.43-1.71
+    for negative bands and 1.84+ for neutral/positive bands.
+
+    For this tape: rate_delta=1.71, LTV=2.24 → adj=1.98 vs orig=2.37 (16% haircut).
+    Equivalent to ~5% annual CPR (standard seasoned turnover assumption).
+    """
+    # dim_rate_delta < 1.84 means note rate is below market (negative rate delta)
+    # 1.84 is the APEX2 neutral band value ("-0.99 to 0.99%")
+    NEUTRAL_RATE_DELTA = 1.84
+    if dim_rate_delta < NEUTRAL_RATE_DELTA:
+        # No refi incentive: only structural factors drive prepay.
+        # Credit and loan_size are refi enablers, not turnover drivers.
+        adj_dims = [dim_rate_delta, dim_ltv]
+    else:
+        # Positive rate delta: full APEX2 multiplier applies
+        adj_dims = [dim_credit, dim_rate_delta, dim_ltv, dim_loan_size]
+
+    return sum(adj_dims) / len(adj_dims)
+
+
 # ===================================================================
 # STAGE 5b: Monte Carlo Validation
 # ===================================================================
-def stage_monte_carlo(df, pkg, n_sims=200):
+def stage_monte_carlo(df, pkg, n_sims=200, prepay_model="stub", annual_cdr=0.0015):
     """Run Monte Carlo simulation for all loans.
 
     Returns updated df, mc_results dict, and portfolio-level MC distribution.
@@ -500,6 +608,8 @@ def stage_monte_carlo(df, pkg, n_sims=200):
         scenarios=["baseline"],
         include_stochastic=True,
         stochastic_seed=42,
+        prepay_model=PrepayModel(prepay_model),
+        annual_cdr=annual_cdr,
     )
 
     mc_results = {}  # loan_id -> LoanValuationResult
@@ -569,7 +679,8 @@ def stage_monte_carlo(df, pkg, n_sims=200):
 # ===================================================================
 # STAGE 5c: Price Comparison (4 estimates at tape's ROE target yield)
 # ===================================================================
-def stage_price_comparison(df, results, pkg, mc_results=None):
+def stage_price_comparison(df, results, pkg, mc_results=None,
+                           prepay_model="stub", annual_cdr=0.0015):
     """Compute 4 price estimates per loan, all at the tape's ROE target yield.
 
     1. Offered — Final Price with ITV cap from tape
@@ -633,16 +744,33 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
             apex2_px = _compute_apex2_price(pandi, prepay_mult, amort_plug, target_yield, cta)
             price_apex2.append(apex2_px)
 
-        # Engine price (APEX2-calibrated): run engine's credit model on
-        # APEX2 amortization schedule, discount at target yield
+        # Engine price: varies by prepay_model
         r = results.get(lid)
         loan = loan_lookup.get(lid)
         if r and loan and not pd.isna(prepay_mult):
             bucket_id = r.bucket_id
-            eng_px = _calibrated_cf_pv(
-                loan, bucket_id, baseline_scenario,
-                float(prepay_mult), target_yield,
-            )
+            if prepay_model == "km_only":
+                eng_px = _km_only_cf_pv(
+                    loan, bucket_id, target_yield,
+                    annual_cdr=annual_cdr,
+                )
+            elif prepay_model == "km_rate_adj":
+                adj_mult = _rate_adj_multiplier(
+                    row.get("dim_credit", 2.25),
+                    row.get("dim_rate_delta", 1.86),
+                    row.get("dim_ltv", 2.20),
+                    row.get("dim_loan_size", 2.56),
+                )
+                eng_px = _calibrated_cf_pv(
+                    loan, bucket_id, baseline_scenario,
+                    float(adj_mult), target_yield,
+                    annual_cdr=annual_cdr,
+                )
+            else:
+                eng_px = _calibrated_cf_pv(
+                    loan, bucket_id, baseline_scenario,
+                    float(prepay_mult), target_yield,
+                )
             price_engine.append(eng_px)
 
             # MC price: scale MC distribution to the calibrated price.
@@ -699,10 +827,26 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
             if pd.isna(ty2) or ty2 <= 0: ty2 = 0.07
             if pd.isna(pm2): pm2 = 2.3
             if r2 and loan2:
-                stress_total += _calibrated_cf_pv(
-                    loan2, r2.bucket_id, baseline_scenario,
-                    float(pm2), ty2, annual_cdr=cdr_val,
-                )
+                if prepay_model == "km_only":
+                    stress_total += _km_only_cf_pv(
+                        loan2, r2.bucket_id, ty2, annual_cdr=cdr_val,
+                    )
+                elif prepay_model == "km_rate_adj":
+                    adj_m = _rate_adj_multiplier(
+                        row2.get("dim_credit", 2.25),
+                        row2.get("dim_rate_delta", 1.86),
+                        row2.get("dim_ltv", 2.20),
+                        row2.get("dim_loan_size", 2.56),
+                    )
+                    stress_total += _calibrated_cf_pv(
+                        loan2, r2.bucket_id, baseline_scenario,
+                        float(adj_m), ty2, annual_cdr=cdr_val,
+                    )
+                else:
+                    stress_total += _calibrated_cf_pv(
+                        loan2, r2.bucket_id, baseline_scenario,
+                        float(pm2), ty2, annual_cdr=cdr_val,
+                    )
         cdr_stress[cdr_label] = stress_total
 
     # Portfolio totals
@@ -741,7 +885,13 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
 
     logger.info("  Offered:  $%s", f"{totals['offered']:,.0f}")
     logger.info("  APEX2:    $%s", f"{totals['apex2']:,.0f}")
-    logger.info("  Engine:   $%s (0.15%% CDR)", f"{totals['engine']:,.0f}")
+    if prepay_model == "km_only":
+        engine_label = f"km_only, CDR={annual_cdr*100:.2f}%"
+    elif prepay_model == "km_rate_adj":
+        engine_label = f"km_rate_adj (APEX2 w/ rate-env adjustment)"
+    else:
+        engine_label = f"{annual_cdr*100:.2f}% CDR"
+    logger.info("  Engine:   $%s (%s)", f"{totals['engine']:,.0f}", engine_label)
     logger.info("  MC:       $%s", f"{totals['mc']:,.0f}")
     for label, val in cdr_stress.items():
         logger.info("    CDR %s: $%s (%+.1f%% vs offered)", label, f"{val:,.0f}", (val / totals['offered'] - 1) * 100)
@@ -872,6 +1022,7 @@ def stage_assemble_html(
     scenarios_9, results, stub_impacts, feature_bounds, scenario_stress,
     registry=None, mc_results=None, portfolio_mc_pvs=None,
     price_totals=None, leaf_curves=None, curve_variant_label="Full History",
+    prepay_model_label="Stub",
 ):
     logger.info("Stage 7: Assembling HTML")
     now = datetime.now().strftime("%B %d, %Y %I:%M %p")
@@ -955,7 +1106,7 @@ def stage_assemble_html(
 
     section9 = _build_assumptions_tab(df, wt_avg)
 
-    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8, section9, curve_variant_label=curve_variant_label)
+    page = _assemble_page(now, section1, section2, section3, section4, section5, section6, section7, section8, section9, curve_variant_label=curve_variant_label, prepay_model_label=prepay_model_label)
     return page
 
 
@@ -2769,7 +2920,7 @@ def _build_assumptions_tab(df, wt_avg):
 # ---------------------------------------------------------------------------
 # Page assembly
 # ---------------------------------------------------------------------------
-def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8="", section9="", curve_variant_label="Full History"):
+def _assemble_page(now, section1, section2, section3, section4, section5, section6, section7="", section8="", section9="", curve_variant_label="Full History", prepay_model_label="Stub"):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3281,6 +3432,7 @@ def _assemble_page(now, section1, section2, section3, section4, section5, sectio
     <div class="subtitle">
       FNBA Loan Tape Analysis &bull; Generated {now}
       &bull; Curves: <strong>{curve_variant_label}</strong>
+      &bull; Prepay: <strong>{prepay_model_label}</strong>
     </div>
   </div>
 
@@ -3428,6 +3580,11 @@ def main():
                             "Survival curve variant to use. E.g. '12mo' loads "
                             "survival_curves_12mo.parquet. Default: full history."
                         ))
+    parser.add_argument("--prepay-model", type=str, choices=["stub", "km_only", "km_rate_adj"],
+                        default="stub",
+                        help="Prepayment model: stub (default), km_only (KM decomposition), or km_rate_adj (APEX2 with rate-env adjustment)")
+    parser.add_argument("--annual-cdr", type=float, default=0.0015,
+                        help="Annual CDR for km_only mode (default: 0.0015 = 0.15%%)")
     args = parser.parse_args()
 
     run_mc = args.mc and not args.no_mc
@@ -3453,6 +3610,14 @@ def main():
         logger.info("Using curve variant: %s (%d curves loaded)",
                      args.curve_variant, len(registry.survival_curves))
 
+    # Prepay model label for report header
+    if args.prepay_model == "km_only":
+        prepay_model_label = f"KM-Only (CDR={args.annual_cdr*100:.2f}%)"
+    elif args.prepay_model == "km_rate_adj":
+        prepay_model_label = f"Rate-Adjusted APEX2 (CDR={args.annual_cdr*100:.2f}%)"
+    else:
+        prepay_model_label = "Stub"
+
     # Stage 3: Bucket assignment
     loan_leaf_map, leaf_loans, leaf_km_life, leaf_mean_life, leaf_curves = stage_bucket_assignment(pkg)
 
@@ -3460,18 +3625,27 @@ def main():
     df, scenarios_9 = stage_apex2_analysis(df)
 
     # Stage 5: Cashflow valuation
-    df, results = stage_cashflow_valuation(df, pkg, loan_leaf_map)
+    df, results = stage_cashflow_valuation(
+        df, pkg, loan_leaf_map,
+        prepay_model=args.prepay_model, annual_cdr=args.annual_cdr,
+    )
 
     # Stage 5b: Monte Carlo (if enabled)
     mc_results = None
     portfolio_mc_pvs = None
     if run_mc:
-        df, mc_results, portfolio_mc_pvs = stage_monte_carlo(df, pkg, n_sims=args.mc_sims)
+        df, mc_results, portfolio_mc_pvs = stage_monte_carlo(
+            df, pkg, n_sims=args.mc_sims,
+            prepay_model=args.prepay_model, annual_cdr=args.annual_cdr,
+        )
     else:
         logger.info("Skipping Monte Carlo (use --mc to enable)")
 
     # Stage 5c: Price comparison (4 estimates)
-    df, price_totals = stage_price_comparison(df, results, pkg, mc_results=mc_results)
+    df, price_totals = stage_price_comparison(
+        df, results, pkg, mc_results=mc_results,
+        prepay_model=args.prepay_model, annual_cdr=args.annual_cdr,
+    )
 
     # Stage 6: Sensitivity
     stub_impacts, feature_bounds, scenario_stress = stage_sensitivity(df, pkg, results, loan_leaf_map)
@@ -3483,6 +3657,7 @@ def main():
         registry=registry, mc_results=mc_results, portfolio_mc_pvs=portfolio_mc_pvs,
         price_totals=price_totals, leaf_curves=leaf_curves,
         curve_variant_label=curve_variant_label,
+        prepay_model_label=prepay_model_label,
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)

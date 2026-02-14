@@ -4,6 +4,13 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+class PrepayModel(str, Enum):
+    """Which prepayment model to use in Track B."""
+    stub = "stub"            # Current: KM as all-causes default + stub prepay
+    km_only = "km_only"      # KM decomposed: CDR for default, remainder for prepay
+    km_rate_adj = "km_rate_adj"  # APEX2 with rate-environment adjustment (report only)
+
+
 class ValuationTrack(str, Enum):
     """Which valuation track to run."""
     A = "A"
@@ -28,3 +35,5 @@ class SimulationConfig(BaseModel):
     stochastic_seed: Optional[int] = 42
     track: ValuationTrack = ValuationTrack.B
     track_a_config: Optional[TrackAConfig] = None
+    prepay_model: PrepayModel = PrepayModel.stub
+    annual_cdr: float = 0.0015

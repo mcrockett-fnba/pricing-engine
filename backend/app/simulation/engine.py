@@ -51,6 +51,9 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
     loan_dict = loan.model_dump()
     bucket_id = assign_bucket(loan_dict)
 
+    prepay_model = config.prepay_model.value
+    annual_cdr = config.annual_cdr
+
     pv_by_scenario: dict[str, float] = {}
     all_mc_pvs: list[float] = []
     baseline_cash_flows = []
@@ -59,7 +62,10 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
         scenario = get_scenario_params(scenario_name)
 
         # Deterministic run
-        det_cfs = project_cash_flows(loan, bucket_id, scenario)
+        det_cfs = project_cash_flows(
+            loan, bucket_id, scenario,
+            prepay_model=prepay_model, annual_cdr=annual_cdr,
+        )
         det_pv = _sum_pv(det_cfs)
         pv_by_scenario[scenario_name] = round(det_pv, 2)
 
@@ -78,7 +84,10 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
 
                 for _ in range(config.n_simulations):
                     shocks = _generate_shocks(loan.remaining_term, rng)
-                    mc_cfs = project_cash_flows(loan, bucket_id, scenario, shocks)
+                    mc_cfs = project_cash_flows(
+                        loan, bucket_id, scenario, shocks,
+                        prepay_model=prepay_model, annual_cdr=annual_cdr,
+                    )
                     all_mc_pvs.append(round(_sum_pv(mc_cfs), 2))
 
     # Percentiles computed from sorted copy; raw order preserved for portfolio aggregation
