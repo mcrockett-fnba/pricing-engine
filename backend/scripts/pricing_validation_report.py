@@ -3449,31 +3449,61 @@ def main():
     logger.info("Wrote %s (%d KB)", out_path, len(html) // 1024)
 
     # --- CSV export ---
+    # Column naming convention (matches report sections):
+    #   Offered      = tape bid price
+    #   APEX2        = replicated APEX2 (prepay only, no credit)
+    #   PPD_OLD      = APEX2 prepay + 0.15% CDR credit haircut (deterministic)
+    #   PE           = Pricing Engine (Monte Carlo mean)
     if not args.no_csv:
         csv_df = pd.DataFrame()
+        # Loan characteristics
         csv_df["loan_id"] = [f"LN-{i+1:04d}" for i in df.index]
         csv_df["balance"] = df["balance"].values
         csv_df["rate"] = df["rate"].values
         csv_df["credit"] = df["credit"].values
-        csv_df["ltv"] = df.get("ltv", pd.Series(dtype=float)).values if "ltv" in df.columns else np.nan
+        csv_df["ltv"] = df["ltv"].values if "ltv" in df.columns else np.nan
         csv_df["seasoning"] = df["seasoning"].values
         csv_df["rem_term"] = df["rem_term"].values
+
+        # Segmentation
         csv_df["leaf_id"] = [loan_leaf_map.get(f"LN-{i+1:04d}", "") for i in df.index]
-        for col in ["price_offered", "price_apex2", "price_engine", "price_mc"]:
-            if col in df.columns:
-                csv_df[col] = df[col].values
-        total_upb_csv = df["balance"].sum()
-        for col in ["price_offered", "price_apex2", "price_engine", "price_mc"]:
-            if col in df.columns:
-                csv_df[col.replace("price_", "cents_")] = df[col].values / df["balance"].values * 100
+
+        # Life & prepayment estimates
+        if "apex2_amort_plug" in df.columns:
+            csv_df["apex2_life_mo"] = df["apex2_amort_plug"].values
+        if "km_life" in df.columns:
+            csv_df["km_50pct_life_mo"] = df["km_life"].values
+        if "engine_mean_life" in df.columns:
+            csv_df["km_mean_life_mo"] = df["engine_mean_life"].values
+        if "apex2_prepay" in df.columns:
+            csv_df["apex2_prepay_mult"] = df["apex2_prepay"].values
+
+        # 4 price estimates (consistent names)
+        price_map = {
+            "price_offered": "price_offered",
+            "price_apex2": "price_apex2",
+            "price_engine": "price_ppd_old",
+            "price_mc": "price_pe",
+        }
+        for src_col, csv_col in price_map.items():
+            if src_col in df.columns:
+                csv_df[csv_col] = df[src_col].values
+                csv_df[csv_col.replace("price_", "cents_")] = df[src_col].values / df["balance"].values * 100
+
+        # Scenario PVs & implied yield
         for col in ["pv_baseline", "pv_mild", "pv_severe", "model_npv", "implied_yield"]:
             if col in df.columns:
                 csv_df[col] = df[col].values
-        for col in ["price_mc_p5", "price_mc_p95", "mc_spread"]:
-            if col in df.columns:
-                csv_df[col] = df[col].values
-        if "km_life" in df.columns:
-            csv_df["km_life"] = df["km_life"].values
+
+        # PE Monte Carlo band
+        pe_mc_map = {
+            "price_mc_p5": "pe_p5",
+            "price_mc_p95": "pe_p95",
+            "mc_spread": "pe_spread_pct",
+        }
+        for src_col, csv_col in pe_mc_map.items():
+            if src_col in df.columns:
+                csv_df[csv_col] = df[src_col].values
 
         csv_path = out_path.with_suffix(".csv")
         csv_df.to_csv(csv_path, index=False)
