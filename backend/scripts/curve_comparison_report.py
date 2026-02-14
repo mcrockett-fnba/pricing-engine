@@ -63,12 +63,30 @@ def load_curves_from_parquet(path: Path) -> dict[int, list[float]]:
     return curves
 
 
-def km_50pct_life(curve: list[float]) -> int:
-    """Month where survival drops below 50%."""
+def km_50pct_life(curve: list[float]) -> int | None:
+    """Month where survival drops below 50%. None if it never crosses."""
     for i, s in enumerate(curve):
         if s < 0.5:
             return i + 1
-    return len(curve)
+    return None
+
+
+def _fmt_life(life: int | None, mean: float | None = None, suffix="mo") -> str:
+    """Format a 50%-life for display."""
+    if life is not None:
+        return f"{life}{suffix}"
+    if mean is not None:
+        return f"&gt;360 ({mean:.0f} mean){suffix}"
+    return f"&gt;360{suffix}"
+
+
+def _life_num(life: int | None, mean: float | None = None) -> int:
+    """Numeric life for calculations; falls back to mean life."""
+    if life is not None:
+        return life
+    if mean is not None:
+        return round(mean)
+    return 360
 
 
 def km_mean_life(curve: list[float]) -> float:
@@ -100,7 +118,7 @@ def estimate_price_from_life(balance: float, rate: float, life_months: int,
 
 
 def _svg_curve_overlay(curve_v1: list[float], curve_v2: list[float],
-                        life_v1: int, life_v2: int,
+                        life_v1: int | None, life_v2: int | None,
                         label_v1: str = "V1 Full History",
                         label_v2: str = "V2 12mo Lookback",
                         width: int = 480, height: int = 220,
@@ -142,12 +160,12 @@ def _svg_curve_overlay(curve_v1: list[float], curve_v2: list[float],
     v1_path = path(curve_v1, "#2563eb")  # blue
     v2_path = path(curve_v2, "#dc2626")  # red
 
-    # Life markers
+    # Life markers (only when curve actually crosses 50%)
     markers = ""
-    if life_v1 <= max_months:
+    if life_v1 is not None and life_v1 <= max_months:
         markers += f'<circle cx="{x(life_v1):.1f}" cy="{y50:.1f}" r="4" fill="#2563eb"/>'
         markers += f'<text x="{x(life_v1)+6:.1f}" y="{y50-6:.1f}" font-size="10" fill="#2563eb">{life_v1}mo</text>'
-    if life_v2 <= max_months:
+    if life_v2 is not None and life_v2 <= max_months:
         markers += f'<circle cx="{x(life_v2):.1f}" cy="{y50:.1f}" r="4" fill="#dc2626"/>'
         markers += f'<text x="{x(life_v2)+6:.1f}" y="{y50+14:.1f}" font-size="10" fill="#dc2626">{life_v2}mo</text>'
 
@@ -230,16 +248,24 @@ def build_comparison_html(tape_path: Path, lookback_months: int) -> str:
         s60_v1 = c_v1[59] if len(c_v1) >= 60 else 1.0
         s60_v2 = c_v2[59] if len(c_v2) >= 60 else 1.0
 
+        # Numeric life for calculations (falls back to mean when 50%-life is None)
+        life_v1_num = _life_num(life_v1, mean_v1)
+        life_v2_num = _life_num(life_v2, mean_v2)
+
+        # Display strings
+        life_v1_disp = _fmt_life(life_v1, mean_v1, suffix="")
+        life_v2_disp = _fmt_life(life_v2, mean_v2, suffix="")
+
         # Simple price sensitivity: PV of P&I for each life estimate
         # This shows directional impact, not exact prices
-        pv_v1 = sum(estimate_price_from_life(l.unpaid_balance, l.interest_rate, min(life_v1, l.remaining_term)) for l in loans)
-        pv_v2 = sum(estimate_price_from_life(l.unpaid_balance, l.interest_rate, min(life_v2, l.remaining_term)) for l in loans)
+        pv_v1 = sum(estimate_price_from_life(l.unpaid_balance, l.interest_rate, min(life_v1_num, l.remaining_term)) for l in loans)
+        pv_v2 = sum(estimate_price_from_life(l.unpaid_balance, l.interest_rate, min(life_v2_num, l.remaining_term)) for l in loans)
 
         total_balance += leaf_balance
         total_balance_v1_pv += pv_v1
         total_balance_v2_pv += pv_v2
 
-        life_delta = life_v2 - life_v1
+        life_delta = life_v2_num - life_v1_num
         pv_delta = pv_v2 - pv_v1
         delta_color = "#dc2626" if pv_delta < 0 else "#16a34a"
 
@@ -249,8 +275,8 @@ def build_comparison_html(tape_path: Path, lookback_months: int) -> str:
           <td class="num">{n_loans}</td>
           <td class="num">${leaf_balance:,.0f}</td>
           <td class="num">{avg_credit:.0f}</td>
-          <td class="num">{life_v1}</td>
-          <td class="num"><strong>{life_v2}</strong></td>
+          <td class="num">{life_v1_disp}</td>
+          <td class="num"><strong>{life_v2_disp}</strong></td>
           <td class="num" style="color:{delta_color}">+{life_delta}</td>
           <td class="num">{mean_v1:.0f}</td>
           <td class="num">{mean_v2:.0f}</td>
@@ -266,8 +292,8 @@ def build_comparison_html(tape_path: Path, lookback_months: int) -> str:
           <h3>Leaf {leaf_id} — {n_loans} loans, ${leaf_balance:,.0f} UPB</h3>
           <div style="font-size:12px;color:#6b7280;margin-bottom:8px">
             Credit {avg_credit:.0f} &bull; Rate {avg_rate*100:.2f}%
-            &bull; 50%-life: <span style="color:#2563eb">{life_v1}mo</span> →
-            <span style="color:#dc2626">{life_v2}mo</span> (+{life_delta}mo)
+            &bull; 50%-life: <span style="color:#2563eb">{life_v1_disp}mo</span> &rarr;
+            <span style="color:#dc2626">{life_v2_disp}mo</span> (+{life_delta}mo)
           </div>
           {chart}
         </div>""")
