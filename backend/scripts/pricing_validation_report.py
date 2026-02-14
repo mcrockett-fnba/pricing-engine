@@ -610,8 +610,6 @@ def stage_price_comparison(df, results, pkg, mc_results=None):
     logger.info("  Offered:  $%s", f"{totals['offered']:,.0f}")
     logger.info("  APEX2:    $%s", f"{totals['apex2']:,.0f}")
     logger.info("  PE MC:    $%s", f"{totals['mc']:,.0f}")
-    for label, val in cdr_stress.items():
-        logger.info("    CDR %s: $%s (%+.1f%% vs offered)", label, f"{val:,.0f}", (val / totals['offered'] - 1) * 100)
     logger.info("  Stage 5c done (%.1fs)", time.time() - t0)
     return df, totals
 
