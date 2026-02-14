@@ -23,22 +23,48 @@ logger = logging.getLogger(__name__)
 _COLUMN_PATTERNS: dict[str, list[str]] = {
     "balance": ["current balance", "balance", "upb", "unpaid"],
     "rate": ["current rate", "interest rate", "rate", "note rate"],
-    "credit": ["credit score", "fico", "blended credit", "credit"],
-    "ltv": ["ltv"],
+    "credit": [
+        "most recent blended credit",
+        "blended recent credit",
+        "recent.*credit score",
+        "credit score for pricing",
+        "credit score",
+        "fico",
+        "blended credit",
+        "credit",
+    ],
+    "ltv": ["ltv used for pricing", "ltv"],
     "seasoning": ["seasoning", "loan age", "age"],
     "rem_term": ["rem term", "remaining term", "rem_term", "fnba calculated rem"],
+    "orig_term": ["original amort", "orig term", "original term"],
+    "property_state": ["property state", "state"],
 }
 
 
 def _find_column(columns: list[str], key: str) -> str | None:
-    """Find a column name by partial case-insensitive match."""
+    """Find a column name by partial case-insensitive match.
+
+    Patterns are tried in order (most specific first).  A pattern containing
+    regex metacharacters (``.*``, ``\\d``, etc.) is treated as a regex;
+    otherwise plain substring matching is used.
+    """
     patterns = _COLUMN_PATTERNS.get(key, [key])
     col_lower = {c: c.lower().strip() for c in columns}
     for pattern in patterns:
         pat = pattern.lower()
-        for orig, low in col_lower.items():
-            if pat in low:
-                return orig
+        # Use regex if pattern contains metacharacters, else substring match
+        if any(ch in pat for ch in ("*", "+", "?", "\\", "^", "$", "|")):
+            try:
+                rx = re.compile(pat)
+                for orig, low in col_lower.items():
+                    if rx.search(low):
+                        return orig
+            except re.error:
+                pass  # fall through to next pattern
+        else:
+            for orig, low in col_lower.items():
+                if pat in low:
+                    return orig
     return None
 
 
@@ -115,22 +141,32 @@ def parse_loan_tape(file: BinaryIO, filename: str) -> Package:
         # Remaining term
         remaining_term = _safe_int(row, col_map.get("rem_term"), 360)
 
-        # Derive original_term = remaining_term + loan_age
-        original_term = remaining_term + loan_age
+        # Original term: prefer tape column, else derive from rem + age
+        orig_from_tape = _safe_int(row, col_map.get("orig_term"), 0)
+        original_term = orig_from_tape if orig_from_tape > 0 else remaining_term + loan_age
+
+        # Property state (2-letter code, optional)
+        state_col = col_map.get("property_state")
+        property_state = None
+        if state_col is not None:
+            raw_state = row.get(state_col)
+            if isinstance(raw_state, str) and len(raw_state.strip()) == 2:
+                property_state = raw_state.strip().upper()
 
         loan_id = f"LN-{len(loans) + 1:04d}"
-        loans.append(
-            Loan(
-                loan_id=loan_id,
-                unpaid_balance=balance,
-                interest_rate=rate,
-                original_term=original_term,
-                remaining_term=remaining_term,
-                loan_age=loan_age,
-                credit_score=credit if credit >= 300 else None,
-                ltv=ltv,
-            )
+        loan_kwargs: dict = dict(
+            loan_id=loan_id,
+            unpaid_balance=balance,
+            interest_rate=rate,
+            original_term=original_term,
+            remaining_term=remaining_term,
+            loan_age=loan_age,
+            credit_score=credit if credit >= 300 else None,
+            ltv=ltv,
         )
+        if property_state:
+            loan_kwargs["state"] = property_state
+        loans.append(Loan(**loan_kwargs))
 
     if not loans:
         raise ValueError("No valid loans could be parsed from the file")
