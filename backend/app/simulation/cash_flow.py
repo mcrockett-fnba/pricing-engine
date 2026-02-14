@@ -72,6 +72,9 @@ def project_cash_flows(
             marginal_default = min(marginal_default * shock.get("default", 1.0), 1.0)
             marginal_prepay = min(marginal_prepay * shock.get("prepay", 1.0), 1.0)
             deq_rate = min(deq_rate * shock.get("deq", 1.0), 1.0)
+            # TODO(Phase 2/3): recovery shock is applied but has no cash effect
+            # under the net-loss framework (expected_recovery=0). Clean up when
+            # LGD/recovery contract is finalized in Phase 0.
             recovery_rate = min(recovery_rate * shock.get("recovery", 1.0), 1.0)
 
         # Survival entering this month (before any events)

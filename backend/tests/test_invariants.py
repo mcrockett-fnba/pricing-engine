@@ -250,20 +250,22 @@ def test_portfolio_npv_sum_of_parts():
 
 
 def test_mc_distribution_not_sorted():
-    """pv_distribution should NOT necessarily be sorted (verifies fix 2).
-    We check that the distribution is not always in sorted order — at least
-    one out of several loans should have an unsorted distribution."""
-    loans = [
-        _make_loan(loan_id=f"UNSORT{i:03d}", remaining_term=60)
-        for i in range(5)
-    ]
+    """pv_distribution preserves simulation-path insertion order, not sorted order.
+
+    Deterministic check: run the same loan twice with fixed seed, confirm both
+    return identical ordering (proving it's deterministic) and that the ordering
+    differs from sorted (proving the engine isn't sorting).
+    """
+    loan = _make_loan(loan_id="UNSORT001", remaining_term=60)
     config = SimulationConfig(n_simulations=50, include_stochastic=True, stochastic_seed=42)
 
-    any_unsorted = False
-    for loan in loans:
-        result = simulate_loan(loan, config)
-        if result.pv_distribution != sorted(result.pv_distribution):
-            any_unsorted = True
-            break
+    r1 = simulate_loan(loan, config)
+    r2 = simulate_loan(loan, config)
 
-    assert any_unsorted, "All loan MC distributions were sorted — fix 2 may not be applied"
+    # Deterministic: same inputs → same path-ordered output
+    assert r1.pv_distribution == r2.pv_distribution
+
+    # Structural: raw order differs from sorted order
+    assert r1.pv_distribution != sorted(r1.pv_distribution), (
+        "pv_distribution is sorted — engine should preserve simulation-path order"
+    )
