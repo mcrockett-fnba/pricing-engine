@@ -685,9 +685,9 @@ def stage_price_comparison(df, results, pkg, mc_results=None,
 
     1. Offered — Final Price with ITV cap from tape
     2. APEX2 Replicated — PV(target_yield, amort_plug, P&I×mult - CTA/plug)
-    3. PPD_OLD — APEX2 amortization schedule with flat CDR credit overlay,
+    3. Engine — APEX2 amortization schedule with flat CDR credit overlay,
        discounted at target yield.
-    4. Pricing Engine — MC distribution scaled to the calibrated PPD_OLD price.
+    4. Pricing Engine — MC distribution scaled to the calibrated Engine price.
 
     Returns updated df with price columns and portfolio-level summary dict.
     """
@@ -1086,6 +1086,7 @@ def stage_assemble_html(
         engine_vs_offered=engine_vs_offered, life_divergence=life_divergence,
         avg_in_bounds=avg_in_bounds, n_stub=n_stub, n_total=n_total,
         tape_plug=tape_plug, avg_km_life=avg_km_life, avg_mean_life=avg_mean_life,
+        prepay_model_label=prepay_model_label,
     )
     section2 = _build_effective_life(
         df, leaf_loans, leaf_km_life, leaf_mean_life, loan_leaf_map, tape_plug,
@@ -1141,7 +1142,8 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
                               price_totals=None, apex2_vs_offered=0,
                               engine_vs_offered=0, life_divergence=0,
                               avg_in_bounds=100, n_stub=0, n_total=5,
-                              tape_plug=0, avg_km_life=0, avg_mean_life=0):
+                              tape_plug=0, avg_km_life=0, avg_mean_life=0,
+                              prepay_model_label="Stub"):
     pt = price_totals or {}
     p_offered = pt.get("offered", total_offered)
     p_apex2 = pt.get("apex2", 0)
@@ -1165,13 +1167,13 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
       </div>
       <div class="summary-card" style="border-top:4px solid #005C3F">
         <div class="card-number">${p_engine:,.0f}</div>
-        <div class="card-label">PPD_OLD (0.15% CDR)</div>
-        <div style="font-size:11px;color:#6b7280">{engine_vs_offered:.1%} of offered</div>
+        <div class="card-label">Pricing Engine</div>
+        <div style="font-size:11px;color:#6b7280">{prepay_model_label} &bull; {engine_vs_offered:.1%} of offered</div>
       </div>
       <div class="summary-card" style="border-top:4px solid #16a34a">
-        <div class="card-number">${p_mc:,.0f}</div>
-        <div class="card-label">Pricing Engine</div>
-        <div style="font-size:11px;color:#6b7280">{f'90% band: ${mc_p5:,.0f}&ndash;${mc_p95:,.0f}' if mc_p5 and mc_p95 else 'n/a'}</div>
+        <div class="card-number">{f'${p_mc:,.0f}' if p_mc > 0 else 'N/A'}</div>
+        <div class="card-label">PE Monte Carlo</div>
+        <div style="font-size:11px;color:#6b7280">{f'90% band: ${mc_p5:,.0f}&ndash;${mc_p95:,.0f}' if mc_p5 and mc_p95 else 'MC not run' if p_mc == 0 else 'n/a'}</div>
       </div>
     </div>"""
 
@@ -1180,18 +1182,19 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     bar_items = [
         ("Offered", p_offered, "#374151"),
         ("APEX2", p_apex2, "#f59e0b"),
-        ("PPD_OLD", p_engine, "#005C3F"),
-        ("Pricing Engine", p_mc, "#16a34a"),
+        ("Engine", p_engine, "#005C3F"),
+        ("PE MC", p_mc, "#16a34a"),
     ]
     bar_rows = []
     for label, val, color in bar_items:
         w_pct = val / max_price * 100 if val > 0 else 0
         vs_off = val / p_offered * 100 if p_offered > 0 and val > 0 else 0
+        display_val = f"${val:,.0f} ({vs_off:.1f}%)" if val > 0 else "N/A"
         bar_rows.append(f"""
         <div class="life-bar-row" style="margin-bottom:6px">
           <span class="life-bar-tag" style="width:60px;font-weight:600">{label}</span>
           <div class="life-bar-track"><div class="life-bar-fill" style="width:{w_pct:.1f}%;background:{color}"></div></div>
-          <span class="life-bar-val" style="width:120px">${val:,.0f} ({vs_off:.1f}%)</span>
+          <span class="life-bar-val" style="width:120px">{display_val}</span>
         </div>""")
     price_bars = f'<div class="chart-container" style="text-align:left">{"".join(bar_rows)}</div>'
 
@@ -1262,8 +1265,8 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
       <span style="font-size:12px;color:#6b7280;font-weight:600">Implied ROE:</span>
       {_roe_chip("Offered", roe_off_val, tape_roe_target)}
       {_roe_chip("APEX2", roe_a2_val, tape_roe_target)}
-      {_roe_chip("PPD_OLD", roe_eng_val, tape_roe_target)}
-      {_roe_chip("PE", roe_mc_val, tape_roe_target)}
+      {_roe_chip("Engine", roe_eng_val, tape_roe_target)}
+      {_roe_chip("PE MC", roe_mc_val, tape_roe_target)}
       <span style="font-size:11px;color:#9ca3af">(target {tape_roe_target:.1%})</span>
     </div>"""
 
@@ -1272,7 +1275,7 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
     direction = "below" if engine_vs_offered < 1.0 else "above"
     spread_banner = f"""
     <div class="info-callout" style="margin-top:12px">
-      <strong>Price spread:</strong> PPD_OLD is {spread_pct:.1f}% {direction} Offered
+      <strong>Price spread:</strong> Engine is {spread_pct:.1f}% {direction} Offered
       &bull; APEX2 is {abs(apex2_vs_offered - 1.0) * 100:.1f}% {"above" if apex2_vs_offered >= 1.0 else "below"} Offered
       &bull; Prepay life: APEX2 {tape_plug:.0f}mo vs KM mean {avg_mean_life:.0f}mo ({life_divergence:.0f}% gap)
       &bull; {n_total - n_stub}/{n_total} sub-models real
@@ -1293,11 +1296,11 @@ def _build_executive_summary(df, pkg, total_upb, total_offered, avg_cents,
           <td style="padding:4px 8px">PV of APEX2 amortization schedule with <em>no</em> credit adjustment. Pure prepayment-driven price.</td>
         </tr>
         <tr style="border-bottom:1px solid #ddd">
-          <td style="padding:4px 8px;font-weight:600">PPD_OLD</td>
-          <td style="padding:4px 8px">Same APEX2 schedule plus a 0.15% annual CDR credit haircut (50% recovery, 25 bps servicing). The gap vs APEX2 = the credit cost.</td>
+          <td style="padding:4px 8px;font-weight:600">Pricing Engine</td>
+          <td style="padding:4px 8px">Deterministic cashflow model ({prepay_model_label}). APEX2 prepay speed with credit overlay (CDR, recovery, servicing). The gap vs APEX2 = the credit cost.</td>
         </tr>
         <tr>
-          <td style="padding:4px 8px;font-weight:600">Pricing Engine</td>
+          <td style="padding:4px 8px;font-weight:600">PE Monte Carlo</td>
           <td style="padding:4px 8px">Monte Carlo mean (200 paths/loan, &sigma;=0.15 stochastic shocks) scaled from the engine&rsquo;s 8% CoC to the target yield.</td>
         </tr>
       </table>
@@ -1541,7 +1544,7 @@ def _build_apex2_dimensional(df, wt_avg):
 def _build_price_comparison(df, price_totals, scenario_stress, results):
     """Section 4: Price Comparison — the core analysis.
 
-    Shows 4 price estimates side by side: Offered, APEX2, PPD_OLD, Pricing Engine.
+    Shows 4 price estimates side by side: Offered, APEX2, Engine, PE Monte Carlo.
     All prices computed at the tape's ROE target yield for apples-to-apples comparison.
     """
     pt = price_totals or {}
@@ -1589,28 +1592,28 @@ def _build_price_comparison(df, price_totals, scenario_stress, results):
 
     comp_table = f"""
     <table class="data-table">
-      <thead><tr><th>Metric</th><th>Offered</th><th>APEX2</th><th>PPD_OLD</th><th>Pricing Engine</th></tr></thead>
+      <thead><tr><th>Metric</th><th>Offered</th><th>APEX2</th><th>Engine</th><th>PE MC</th></tr></thead>
       <tbody>
         <tr>
           <td>Portfolio Total</td>
           <td class="num">${p_off:,.0f}</td>
           <td class="num">${p_a2:,.0f}</td>
           <td class="num">${p_eng:,.0f}</td>
-          <td class="num">${p_mc:,.0f}</td>
+          <td class="num">{f'${p_mc:,.0f}' if p_mc > 0 else 'N/A'}</td>
         </tr>
         <tr>
           <td>Cents / $</td>
           <td class="num">{p_off/total_upb*100:.1f}</td>
           <td class="num">{p_a2/total_upb*100:.1f}</td>
           <td class="num">{p_eng/total_upb*100:.1f}</td>
-          <td class="num">{p_mc/total_upb*100:.1f}</td>
+          <td class="num">{f'{p_mc/total_upb*100:.1f}' if p_mc > 0 else 'N/A'}</td>
         </tr>
         <tr>
           <td>vs Offered</td>
           <td class="num">&mdash;</td>
           <td class="num">${p_a2-p_off:+,.0f} ({(p_a2/p_off-1)*100:+.1f}%)</td>
           <td class="num">${p_eng-p_off:+,.0f} ({(p_eng/p_off-1)*100:+.1f}%)</td>
-          <td class="num">${p_mc-p_off:+,.0f} ({(p_mc/p_off-1)*100:+.1f}%)</td>
+          <td class="num">{f'${p_mc-p_off:+,.0f} ({(p_mc/p_off-1)*100:+.1f}%)' if p_mc > 0 else 'N/A'}</td>
         </tr>
         {roe_row}
         {f'<tr><td style="padding-left:16px;color:#6b7280;font-size:12px">PE p5 (downside)</td><td></td><td></td><td></td><td class="num">${mc_p5:,.0f}</td></tr>' if mc_p5 else ''}
@@ -1629,10 +1632,9 @@ def _build_price_comparison(df, price_totals, scenario_stress, results):
       &bull; <strong>Offered</strong> &mdash; Final Price with ITV Cap from the tape ($80.74M).<br>
       &bull; <strong>APEX2 Replicated</strong> &mdash; PV of accelerated P&amp;I (&times;prepay mult) minus CTA,
       over the amortization plug, at the target yield. No credit losses. Validates within 1.5% of Bid Offered.<br>
-      &bull; <strong>PPD_OLD (0.15% CDR)</strong> &mdash; month-by-month amortization using APEX2 prepay speed,
-      with a 0.15% annual conditional default rate (50% recovery) overlaid.
-      Industry benchmark for seasoned performing non-QM: 0.2&ndash;2.0% CDR.<br>
-      &bull; <strong>Pricing Engine</strong> &mdash; Monte Carlo mean (200 paths/loan), scaled from the
+      &bull; <strong>Pricing Engine</strong> &mdash; deterministic cashflow model with CDR credit overlay
+      (0.15% default, 50% recovery, 25 bps servicing). Prepay speed varies by model mode.<br>
+      &bull; <strong>PE Monte Carlo</strong> &mdash; Monte Carlo mean (200 paths/loan), scaled from the
       engine&rsquo;s 8% CoC to the target yield. Preserves the relative distribution shape.
     </div>"""
 
@@ -1722,7 +1724,7 @@ def _build_price_comparison(df, price_totals, scenario_stress, results):
     <table class="data-table" id="priceTable">
       <thead><tr>
         <th>Loan</th><th>Balance</th><th>Rate</th><th>Plug</th>
-        <th>Offered</th><th>APEX2</th><th>PPD_OLD</th><th>PE</th><th>PPD vs Off</th>
+        <th>Offered</th><th>APEX2</th><th>Engine</th><th>PE MC</th><th>Eng vs Off</th>
       </tr></thead>
       <tbody>{"".join(price_rows)}</tbody>
     </table>
@@ -1954,7 +1956,7 @@ def _build_loan_detail(df, loan_leaf_map, leaf_km_life, results):
       <thead><tr>
         <th>Loan</th><th>Balance</th><th>Rate</th><th>Credit</th>
         <th>Leaf</th><th>Plug</th>
-        <th>Offered</th><th>APEX2</th><th>PPD_OLD</th><th>PE</th><th>PPD vs Off</th>
+        <th>Offered</th><th>APEX2</th><th>Engine</th><th>PE MC</th><th>Eng vs Off</th>
       </tr></thead>
       <tbody>{"".join(rows)}</tbody>
     </table>"""
@@ -2305,8 +2307,8 @@ def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress
       <thead><tr><th>Metric</th><th>Price (at Target Yield)</th><th>vs Offered</th><th>Notes</th></tr></thead>
       <tbody>
         <tr><td>Offered Price (tape)</td><td class="num">${total_offered:,.0f}</td><td class="num">&mdash;</td><td>Bid as offered</td></tr>
-        <tr><td>PPD_OLD (0.15% CDR)</td><td class="num">${total_engine_price:,.0f}</td><td class="num">{eng_vs_offered:.1%}</td><td>APEX2 prepay + flat CDR at target yield</td></tr>
-        <tr><td>Pricing Engine (mean)</td><td class="num">${total_mc_price:,.0f}</td><td class="num">{mc_vs_offered:.1%}</td><td>Mean across {n_sims} stochastic paths</td></tr>
+        <tr><td>Engine (0.15% CDR)</td><td class="num">${total_engine_price:,.0f}</td><td class="num">{eng_vs_offered:.1%}</td><td>APEX2 prepay + flat CDR at target yield</td></tr>
+        <tr><td>PE Monte Carlo (mean)</td><td class="num">${total_mc_price:,.0f}</td><td class="num">{mc_vs_offered:.1%}</td><td>Mean across {n_sims} stochastic paths</td></tr>
         <tr><td>PE p5 (downside price)</td><td class="num">${total_mc_p5:,.0f}</td><td class="num">{total_mc_p5/total_offered:.1%}</td><td>Worst 5% of simulations</td></tr>
         <tr><td>PE p95 (upside price)</td><td class="num">${total_mc_p95:,.0f}</td><td class="num">{total_mc_p95/total_offered:.1%}</td><td>Best 5% of simulations</td></tr>
         <tr><td>PE det vs mean diff</td><td class="num">${total_mc_price - total_engine_price:+,.0f}</td><td class="num">{(total_mc_price/total_engine_price - 1)*100 if total_engine_price > 0 else 0:+.2f}%</td><td>Should be near zero (linear model)</td></tr>
@@ -2397,7 +2399,7 @@ def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress
     spread_table = f"""
     <table class="data-table" id="mcTable">
       <thead><tr>
-        <th>Loan</th><th>Balance</th><th>Rate</th><th>Offered</th><th>PPD_OLD</th>
+        <th>Loan</th><th>Balance</th><th>Rate</th><th>Offered</th><th>Engine</th>
         <th>PE Price</th><th>PE p5</th><th>PE p95</th><th>Spread</th>
       </tr></thead>
       <tbody>{"".join(spread_rows)}</tbody>
@@ -2417,7 +2419,7 @@ def _build_monte_carlo_section(df, mc_results, portfolio_mc_pvs, scenario_stress
     <h2 class="section-title">7. Pricing Engine Validation</h2>
     {note}
     {cards}
-    <h3 class="subsection">Price Comparison: PPD_OLD vs Pricing Engine vs Offered</h3>
+    <h3 class="subsection">Price Comparison: Engine vs PE Monte Carlo vs Offered</h3>
     {comparison}
     {noise_diagnostic}
     <h3 class="subsection">NPV Distribution ({n_sims} simulations, 8% CoC)</h3>
@@ -2843,16 +2845,16 @@ def _build_assumptions_tab(df, wt_avg):
       <thead><tr><th>Parameter</th><th>Value</th><th>Used In</th><th>Notes / Questions for Management</th></tr></thead>
       <tbody>
         <tr>
-          <td>Annual CDR</td><td class="num">0.15%</td><td>PPD_OLD price</td>
+          <td>Annual CDR</td><td class="num">0.15%</td><td>Engine price</td>
           <td class="note-col">Industry range for seasoned non-QM is 0.2&ndash;2.0%. Current value is <em>below</em> industry floor.
               Should this vary by credit tier or pool vintage?</td>
         </tr>
         <tr>
-          <td>Recovery Rate</td><td class="num">50%</td><td>PPD_OLD price</td>
+          <td>Recovery Rate</td><td class="num">50%</td><td>Engine price</td>
           <td class="note-col">Typical for agency collateral. Is 50% appropriate for non-QM? What does historical recovery data show?</td>
         </tr>
         <tr>
-          <td>Servicing Cost (CF calc)</td><td class="num">25 bps</td><td>PPD_OLD cash flows</td>
+          <td>Servicing Cost (CF calc)</td><td class="num">25 bps</td><td>Engine cash flows</td>
           <td class="note-col"><span class="assumption-flag">&ne; ROE calc</span> The cash-flow PV calc uses 25 bps but the
               implied-ROE formula uses the tape&rsquo;s servicing cost (fallback 49 bps). These should match. Confirm actual servicing cost.</td>
         </tr>
@@ -2871,7 +2873,7 @@ def _build_assumptions_tab(df, wt_avg):
           <td class="note-col">Overridable via <code>--mc-sims</code>. 200 is a speed/accuracy trade-off; 500+ gives smoother tails.</td>
         </tr>
         <tr>
-          <td>Default Prepay Multiplier</td><td class="num">2.3&times;</td><td>PPD_OLD, APEX2</td>
+          <td>Default Prepay Multiplier</td><td class="num">2.3&times;</td><td>Engine, APEX2</td>
           <td class="note-col">Fallback when tape doesn&rsquo;t provide <code>apex2_prepay</code> / <code>avg_4dim</code>. Confirm this matches current APEX2 assumptions.</td>
         </tr>
         <tr>
@@ -2899,7 +2901,7 @@ def _build_assumptions_tab(df, wt_avg):
     return f"""
     <h2 class="section-title">9. Assumptions &amp; Review Checklist</h2>
     <p class="section-hint">
-      All four prices (Offered, APEX2, PPD_OLD, Pricing Engine) are present values discounted at the
+      All four prices (Offered, APEX2, Engine, PE Monte Carlo) are present values discounted at the
       tape&rsquo;s ROE target yield, making them directly comparable. Differences come from methodology
       (how prepayment and credit losses are modeled), not from different return targets.
     </p>
@@ -3671,7 +3673,7 @@ def main():
     # Column naming convention (matches report sections):
     #   Offered      = tape bid price
     #   APEX2        = replicated APEX2 (prepay only, no credit)
-    #   PPD_OLD      = APEX2 prepay + 0.15% CDR credit haircut (deterministic)
+    #   Engine      = APEX2 prepay + 0.15% CDR credit haircut (deterministic)
     #   PE           = Pricing Engine (Monte Carlo mean)
     if not args.no_csv:
         csv_df = pd.DataFrame()
@@ -3701,8 +3703,8 @@ def main():
         price_map = {
             "price_offered": "price_offered",
             "price_apex2": "price_apex2",
-            "price_engine": "price_ppd_old",
-            "price_mc": "price_pe",
+            "price_engine": "price_engine",
+            "price_mc": "price_pe_mc",
         }
         for src_col, csv_col in price_map.items():
             if src_col in df.columns:
