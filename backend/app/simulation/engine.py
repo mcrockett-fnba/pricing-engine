@@ -5,6 +5,7 @@ LoanValuationResult with deterministic PVs, MC distributions, and percentiles.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 
@@ -69,7 +70,7 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
             if config.include_stochastic and config.n_simulations > 0:
                 if config.stochastic_seed is not None:
                     base_seed = config.stochastic_seed
-                    loan_hash = hash(loan.loan_id) & 0xFFFFFFFF
+                    loan_hash = int(hashlib.sha256(loan.loan_id.encode()).hexdigest(), 16) & 0xFFFFFFFF
                     seed = (base_seed + loan_hash) & 0xFFFFFFFF
                     rng = random.Random(seed)
                 else:
@@ -80,15 +81,14 @@ def simulate_loan(loan: Loan, config: SimulationConfig) -> LoanValuationResult:
                     mc_cfs = project_cash_flows(loan, bucket_id, scenario, shocks)
                     all_mc_pvs.append(round(_sum_pv(mc_cfs), 2))
 
-    # Sort MC distribution for percentile extraction
-    all_mc_pvs.sort()
+    # Percentiles computed from sorted copy; raw order preserved for portfolio aggregation
+    sorted_pvs = sorted(all_mc_pvs)
 
-    # Percentiles
     pv_percentiles: dict[str, float] = {}
-    if all_mc_pvs:
+    if sorted_pvs:
         for p_label, p_val in [("p5", 0.05), ("p25", 0.25), ("p50", 0.50), ("p75", 0.75), ("p95", 0.95)]:
-            idx = min(int(p_val * len(all_mc_pvs)), len(all_mc_pvs) - 1)
-            pv_percentiles[p_label] = all_mc_pvs[idx]
+            idx = min(int(p_val * len(sorted_pvs)), len(sorted_pvs) - 1)
+            pv_percentiles[p_label] = sorted_pvs[idx]
 
     # Expected PV = baseline deterministic
     expected_pv = pv_by_scenario.get("baseline", 0.0)

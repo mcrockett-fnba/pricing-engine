@@ -148,7 +148,8 @@ def test_mc_distribution_populated():
     result = simulate_loan(loan, config)
     # Baseline-only MC: 10 sims
     assert len(result.pv_distribution) == 10
-    assert result.pv_distribution == sorted(result.pv_distribution)
+    # Distribution is no longer sorted — raw simulation-path order preserved
+    assert len(result.pv_distribution) > 0
 
 
 def test_mc_reproducible_with_seed():

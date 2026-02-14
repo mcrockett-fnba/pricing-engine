@@ -86,11 +86,10 @@ def project_cash_flows(
         # Survival-weighted expected payment
         expected_payment = scheduled * cumulative_survival
 
-        # Expected loss = default_prob * LGD * balance * survival_entering_month
-        expected_loss = marginal_default * tx.loss_severity * balance * survival_entering
-
-        # Expected recovery on defaulted amount
-        expected_recovery = marginal_default * recovery_rate * balance * survival_entering
+        # Net loss from default: ensures default always costs money
+        net_lgd = max(tx.loss_severity, 1.0 - recovery_rate)
+        expected_loss = marginal_default * net_lgd * balance * survival_entering
+        expected_recovery = 0.0
 
         # Expected prepayment: borrower pays off remaining balance at par
         expected_prepayment = marginal_prepay * balance * survival_entering

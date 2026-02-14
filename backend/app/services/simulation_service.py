@@ -40,8 +40,7 @@ def run_valuation(package: Package, config: SimulationConfig) -> PackageValuatio
     npv_distribution: list[float] = []
     if loan_results and loan_results[0].pv_distribution:
         n_sims = len(loan_results[0].pv_distribution)
-        # Sort each loan's distribution so we can add element-wise
-        # (this is a simplification — correlated sum)
+        # Sum by simulation-path index across loans (preserves natural correlation)
         for i in range(n_sims):
             total = sum(
                 lr.pv_distribution[i] if i < len(lr.pv_distribution) else lr.expected_pv

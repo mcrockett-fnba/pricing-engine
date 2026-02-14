@@ -52,6 +52,9 @@ def get_monthly_transitions(
         # Survival and marginal default from curve
         s_curr = curve[m]
         s_prev = curve[m - 1] if m > 0 else 1.0
+        # NOTE: KM survival captures all exits (default + prepay + payoff).
+        # marginal_default here is the all-causes hazard from KM, not pure default.
+        # This is an interim approach; Phase 3 will implement proper competing risks.
         marginal_default = max(1.0 - s_curr / s_prev, 0.0) if s_prev > 0 else 0.0
 
         # DEQ rate from stub model
