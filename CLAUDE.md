@@ -308,6 +308,36 @@ The full plan is at `~/.claude/plans/merry-marinating-zephyr.md`.
 2. Replace `noteDateYear` with `interestRate - currentTreasury` (rate delta) for forward-looking segmentation?
 3. Start with 3 original scenarios + 2 rate-shift, or go straight to 12-scenario matrix?
 
+### TODO: MC Engine ← APEX2 Prepay Integration
+
+Feed the calibrated APEX2 time-varying prepay speed into the Monte Carlo engine so that bid analysis / ROE distributions reflect APEX2 assumptions instead of stub CPR.
+
+**Files to modify:**
+
+1. **`backend/app/models/simulation.py`** — Add `treasury_curve` (list of TreasuryPoint) and `prepay_source` enum (`"stub"` | `"apex2"`) to `SimulationConfig`. Default to `"stub"` for backward compatibility.
+
+2. **`backend/app/simulation/cash_flow.py`** (`project_cash_flows`) — When `prepay_source == "apex2"`:
+   - Import `interpolate_treasury`, `get_rate_delta_band`, `_get_apex2_tables` from `prepayment_analysis`
+   - Each month: interpolate treasury → compute rate delta dim → average 4 dims → derive extra principal (replaces stub `marginal_prepay`)
+   - The loan's 3 fixed APEX2 dims (credit, LTV, loan size) are computed once at the start of `project_cash_flows` and stored
+
+3. **`backend/app/simulation/engine.py`** (`simulate_loan`) — Pass `treasury_curve` and `prepay_source` through to `project_cash_flows`. For MC scenarios, the treasury curve could be shifted (e.g., +100bp for recession scenario).
+
+4. **`backend/app/services/simulation_service.py`** (`run_valuation`) — Accept treasury scenarios in the valuation request. When `prepay_source == "apex2"`, skip the stub prepay model entirely.
+
+5. **`frontend/src/views/RunValuation.vue`** — Add a toggle for "APEX2 prepay" vs "Stub prepay" and treasury curve inputs (can reuse the scenario table pattern from PrepayMultiplierPanel).
+
+**Key design decisions:**
+- The APEX2 multiplier produces a **dollar amount** of extra principal per month (`pandi * (mult - 1)`), not a CPR. This replaces the `prepay_rate` and `prepay_amount` in the cash flow, NOT the state transition probabilities.
+- The existing state machine (current → delinquent → default → recovered) remains unchanged. APEX2 prepay is additive on top of scheduled amortization for loans in "current" state.
+- Scenario stress can be applied via treasury curve shifts: baseline = president's rate forecast, mild recession = +100bp, severe = +200bp. This replaces the current flat scenario multipliers for prepay.
+
+**Test plan:**
+- `test_apex2_prepay_in_cash_flow`: verify that `project_cash_flows` with `prepay_source="apex2"` uses APEX2-derived prepay amounts
+- `test_apex2_vs_stub_differ`: confirm MC results with APEX2 prepay differ from stub
+- `test_backward_compat`: default `prepay_source="stub"` produces identical results to current behavior
+- `test_treasury_shift_stress`: recession treasury curve produces lower valuations
+
 ## Scripts Reference
 
 | Script | Purpose | Run From |

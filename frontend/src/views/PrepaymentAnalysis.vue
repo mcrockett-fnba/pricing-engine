@@ -69,6 +69,8 @@
 
       <CreditBandTable :bands="store.result.credit_bands" />
 
+      <PrepayMultiplierPanel :result="store.result" />
+
       <div class="loan-details card">
         <h2 @click="detailsOpen = !detailsOpen" class="collapsible">
           Loan Multiplier Details
@@ -116,6 +118,7 @@ import { usePrepaymentStore } from '../stores/prepayment'
 import EffectiveLifeChart from '../components/EffectiveLifeChart.vue'
 import SeasoningChart from '../components/SeasoningChart.vue'
 import CreditBandTable from '../components/CreditBandTable.vue'
+import PrepayMultiplierPanel from '../components/PrepayMultiplierPanel.vue'
 
 const valStore = useValuationStore()
 const store = usePrepaymentStore()

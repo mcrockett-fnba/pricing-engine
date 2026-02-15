@@ -15,6 +15,7 @@ from app.models.prepayment import (
     PrepaymentAnalysisResult,
     PrepaymentConfig,
     PrepaymentSummary,
+    RateCurveScenarioResult,
     ScenarioResult,
     SeasoningSensitivityPoint,
 )
@@ -232,6 +233,78 @@ def project_effective_life(
     return remaining_term
 
 
+def interpolate_treasury(points: list[tuple[int, float]], month: int) -> float:
+    """Linear interpolation of treasury rate from (month, rate) curve points.
+
+    Flat extrapolation beyond endpoints.
+    """
+    if not points:
+        return 4.5
+    if len(points) == 1:
+        return points[0][1]
+    # Sort by month
+    pts = sorted(points, key=lambda p: p[0])
+    if month <= pts[0][0]:
+        return pts[0][1]
+    if month >= pts[-1][0]:
+        return pts[-1][1]
+    # Find surrounding points
+    for i in range(len(pts) - 1):
+        m0, r0 = pts[i]
+        m1, r1 = pts[i + 1]
+        if m0 <= month <= m1:
+            if m1 == m0:
+                return r0
+            t = (month - m0) / (m1 - m0)
+            return r0 + t * (r1 - r0)
+    return pts[-1][1]
+
+
+def project_effective_life_with_curve(
+    balance: float,
+    pandi: float,
+    rate_pct: float,
+    dim_credit: float,
+    dim_ltv: float,
+    dim_loan_size: float,
+    treasury_curve: list[tuple[int, float]],
+    seasoning: float,
+    remaining_term: int,
+    ramp_months: int = 30,
+) -> int:
+    """Monthly projection with time-varying APEX2 multiplier from a treasury curve.
+
+    The rate delta dimension is recomputed each month based on the interpolated
+    treasury rate.  The other 3 dimensions (credit, LTV, loan size) are fixed.
+
+    Returns effective life in months.
+    """
+    _, rate_delta_rates, _, _ = _get_apex2_tables()
+    r = rate_pct / 12 / 100
+    bal = balance
+
+    for m in range(1, remaining_term + 1):
+        if bal <= 1:
+            return m - 1
+        age = seasoning + m
+        s = seasoning_multiplier(age, ramp_months)
+
+        # Time-varying rate delta dimension
+        tsy = interpolate_treasury(treasury_curve, m)
+        rd_band = get_rate_delta_band(rate_pct, tsy)
+        dim_rate_delta = rate_delta_rates.get(rd_band, 1.8)
+
+        multiplier = (dim_credit + dim_rate_delta + dim_ltv + dim_loan_size) / 4.0
+        extra_base = pandi * max(multiplier - 1, 0)
+
+        interest = bal * r
+        sched = min(pandi, bal * (1 + r))
+        principal = sched - interest
+        extra = extra_base * s
+        bal = max(bal - principal - extra, 0)
+    return remaining_term
+
+
 # ---------------------------------------------------------------------------
 # Main analysis entry point
 # ---------------------------------------------------------------------------
@@ -285,6 +358,9 @@ def run_prepayment_analysis(
         wtd_avg_seasoning=wtd_avg("age"),
         wtd_avg_remaining_term=wtd_avg("rem"),
         treasury_10y=treasury,
+        wtd_avg_multiplier=round(
+            sum(ld["dims"]["avg_4dim"] * ld["balance"] for ld in loan_data) / total_upb, 4
+        ),
     )
 
     # --- Scenarios: {4-dim avg, credit-only} x {flat, seasoned actual, seasoned age=0} ---
@@ -404,7 +480,38 @@ def run_prepayment_analysis(
             loan_size_band=d["loan_size_band"],
             dim_loan_size=round(d["dim_loan_size"], 4),
             avg_4dim=round(d["avg_4dim"], 4),
+            balance=round(ld["balance"], 2),
+            pandi=round(ld["pandi"], 2),
+            rate_pct=round(ld["rate_pct"], 4),
+            remaining_term=ld["rem"],
+            loan_age=ld["age"],
         ))
+
+    # --- Rate delta lookup table for frontend ---
+    _, rate_delta_rates, _, _ = _get_apex2_tables()
+
+    # --- Treasury rate curve scenarios (if provided) ---
+    rate_curve_results = None
+    if cfg.treasury_scenarios:
+        rate_curve_results = []
+        for scenario in cfg.treasury_scenarios:
+            curve = [(p.month, p.rate) for p in scenario.points]
+            life_total = 0.0
+            for ld in loan_data:
+                d = ld["dims"]
+                life = project_effective_life_with_curve(
+                    ld["balance"], ld["pandi"], ld["rate_pct"],
+                    d["dim_credit"], d["dim_ltv"], d["dim_loan_size"],
+                    curve, ld["age"], ld["rem"],
+                    ramp_months=ramp,
+                )
+                life_total += life * ld["balance"]
+            wtd_life = life_total / total_upb
+            rate_curve_results.append(RateCurveScenarioResult(
+                scenario_name=scenario.name,
+                wtd_eff_life_months=round(wtd_life, 1),
+                wtd_eff_life_years=round(wtd_life / 12, 2),
+            ))
 
     return PrepaymentAnalysisResult(
         summary=summary,
@@ -412,4 +519,6 @@ def run_prepayment_analysis(
         credit_bands=credit_bands,
         seasoning_sensitivity=sensitivity,
         loan_details=loan_details,
+        rate_delta_rates=rate_delta_rates,
+        rate_curve_results=rate_curve_results,
     )
